@@ -1,2 +1,2 @@
 # data-ingestion
-Tools of ingesting data from azure's public datasets
+Tools for ingesting data from azure's public datasets
