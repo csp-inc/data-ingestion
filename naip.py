@@ -4,25 +4,21 @@ Usage
 
 """
 import argparse
-import asyncio
-import io
-import logging
+import concurrent.futures
 import os
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from csv import DictReader
 from pathlib import Path
 
 import fiona.transform
 import numpy as np
 import rasterio
-from azure.storage.blob.aio import BlobClient
 from PIL import Image
 from rasterio.windows import Window
 
 from utils.naip import NAIPTileIndex
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 # Workaround for a problem in older rasterio versions
 os.environ["CURL_CA_BUNDLE"] = "/etc/ssl/certs/ca-certificates.crt"
 
@@ -37,7 +33,7 @@ NAIP_ROOT = "https://naipblobs.blob.core.windows.net/naip"
 # BLOB_STORAGE_DIR = '/home/datablob'
 
 
-async def main(input_path, output_dir, threads):
+def main(input_path, output_dir, threads):
     # set up
     temp_dir = os.path.join(tempfile.gettempdir(), "naip")
     os.makedirs(temp_dir, exist_ok=True)
@@ -47,21 +43,30 @@ async def main(input_path, output_dir, threads):
 
     with open(input_path, "r") as fobj:
         plots = DictReader(fobj)
-        cors = [get_and_write_tile(plot, index, output_dir) for plot in plots]
-        await asyncio.gather(*cors)
+
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        future_to_index = {
+            executor.submit(get_and_write_tile, plot, index, output_dir): plot["INDEX"]
+            for plot in plots
+        }
+        for future in concurrent.futures.as_completed(future_to_index):
+            try:
+                future.result()
+            except Exception as e:
+                print(e)
+            else:
+                print(f"Finished {future_to_index[future]}")
 
 
-async def get_and_write_tile(plot, index, output_dir):
-    logger.debug(f"Starting fetch for sample {plot['INDEX']}")
-    tile, state = await get_plot_tile_and_state(plot, index)
+def get_and_write_tile(plot, index, output_dir):
+    tile, state = get_plot_tile_and_state(plot, index)
     if tile is not None:
         write_tile(tile, plot, state, output_dir)
-        print(f"completed {plot['INDEX']}")
     else:
         print(f'No acceptable tile for {plot["INDEX"]}')
 
 
-async def get_plot_tile_and_state(plot, index):
+def get_plot_tile_and_state(plot, index):
     """Given a plot dictionary and the NAIP rtree index fetch the desired 256x256 image tile.
 
     Args:
@@ -79,20 +84,18 @@ async def get_plot_tile_and_state(plot, index):
     naip_files = index.lookup_tile(lat, lon)
 
     if naip_files is None or len(naip_files) == 0:
-        logging.warn(f'No intersection, skipping index {plot["INDEX"]}')
+        print(f'No intersection, skipping index {plot["INDEX"]}')
         return None, None
 
     # check for the matching or closest year
     naip_years = np.array([int(n.split("/")[2]) for n in naip_files])
     closest = min(naip_years, key=lambda x: abs(x - query_year))
     match_idx = np.where(naip_years == closest)[0][0]
-
+    # We could do some more checking here to make sure that the file is from 2017 Maryland,
+    # but that's not the point
     image_url = NAIP_ROOT + "/" + naip_files[match_idx]
-    blob = BlobClient.from_blob_url(image_url)
-    stream_downloader = await blob.download_blob()
-    io_stream = io.BytesIO(await stream_downloader.readall())
 
-    with rasterio.open(io_stream) as f:
+    with rasterio.open(image_url) as f:
 
         # Each NAIP tile has its own coordinate system that is *not* lat/lon
         crs = f.crs
@@ -155,4 +158,4 @@ if __name__ == "__main__":
     )
     parser.add_argument("-t", "--threads", help="threads to use", type=int, default=1)
     args = parser.parse_args()
-    asyncio.run(main(args.input_path, args.output_dir, args.threads))
+    main(args.input_path, args.output_dir, args.threads)

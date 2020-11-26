@@ -25,7 +25,6 @@ docker-run:
 	  -v `pwd`:`pwd` \
 	  -w `pwd` \
 	  -p 8888:8888 \
-	  -m 8g \
 	  -it bgs:experiment  \
 	  /bin/bash -c "/bin/bash"
 

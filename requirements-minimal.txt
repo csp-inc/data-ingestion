@@ -1,4 +1,3 @@
-aiohttp
 azure-cli
 azure-storage-blob
 dask[complete]
