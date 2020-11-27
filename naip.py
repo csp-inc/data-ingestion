@@ -7,8 +7,11 @@ import argparse
 import concurrent.futures
 import os
 import tempfile
+from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import ThreadPoolExecutor
 from csv import DictReader
+from itertools import chain
+from itertools import islice
 from pathlib import Path
 
 import fiona.transform
@@ -24,8 +27,6 @@ os.environ["CURL_CA_BUNDLE"] = "/etc/ssl/certs/ca-certificates.crt"
 
 CRS = "EPSG:4326"
 
-WORKERS = 100
-
 # Storage locations are documented at http://aka.ms/ai4edata-naip
 NAIP_ROOT = "https://naipblobs.blob.core.windows.net/naip"
 
@@ -33,17 +34,34 @@ NAIP_ROOT = "https://naipblobs.blob.core.windows.net/naip"
 # BLOB_STORAGE_DIR = '/home/datablob'
 
 
-def main(input_path, output_dir, threads):
+def main(input_path, output_dir, workers, threads, chunk_size):
     # set up
     temp_dir = os.path.join(tempfile.gettempdir(), "naip")
     os.makedirs(temp_dir, exist_ok=True)
     index = NAIPTileIndex(temp_dir)
 
-    print(f"Using {threads} threads")
+    print(f"Using {workers} workers with {threads} threads each")
 
     with open(input_path, "r") as fobj:
         plots = DictReader(fobj)
+        chunks = chunk_iterable(plots, chunk_size)
+        with ProcessPoolExecutor(max_workers=workers) as ppexecutor:
+            future_to_chunk_idx = {
+                ppexecutor.submit(
+                    process_chunk, list(chunk), index, output_dir, threads
+                ): i
+                for i, chunk in enumerate(chunks)
+            }
+            for future in concurrent.futures.as_completed(future_to_chunk_idx):
+                try:
+                    future.result()
+                except Exception as e:
+                    print(e)
+                else:
+                    print(f"Finished chunk {future_to_chunk_idx[future]}")
 
+
+def process_chunk(plots, index, output_dir, threads):
     with ThreadPoolExecutor(max_workers=threads) as executor:
         future_to_index = {
             executor.submit(get_and_write_tile, plot, index, output_dir): plot["INDEX"]
@@ -56,6 +74,12 @@ def main(input_path, output_dir, threads):
                 print(e)
             else:
                 print(f"Finished {future_to_index[future]}")
+
+
+def chunk_iterable(iterable, size):
+    itr = iter(iterable)
+    for first in itr:
+        yield chain([first], islice(itr, size - 1))
 
 
 def get_and_write_tile(plot, index, output_dir):
@@ -97,22 +121,15 @@ def get_plot_tile_and_state(plot, index):
 
     with rasterio.open(image_url) as f:
 
-        # Each NAIP tile has its own coordinate system that is *not* lat/lon
-        crs = f.crs
-
-        # This object will let us convert between tile coordinates (these will be local
-        # state CRS) and tile offsets (i.e. pixel indices)
-        transform = f.transform
-
         # Convert our lat/lon point to the local NAIP coordinate system
         x_tile_crs, y_tile_crs = fiona.transform.transform(
-            CRS, crs.to_string(), [lon], [lat]
+            CRS, f.crs.to_string(), [lon], [lat]
         )
         x_tile_crs = x_tile_crs[0]
         y_tile_crs = y_tile_crs[0]
 
         # Convert our new x/y coordinates into pixel indices
-        x_tile_offset, y_tile_offset = ~transform * (x_tile_crs, y_tile_crs)
+        x_tile_offset, y_tile_offset = ~f.transform * (x_tile_crs, y_tile_crs)
         x_tile_offset = int(np.floor(x_tile_offset))
         y_tile_offset = int(np.floor(y_tile_offset))
 
@@ -120,7 +137,8 @@ def get_plot_tile_and_state(plot, index):
         image_crop = f.read(
             window=Window(x_tile_offset - 128, y_tile_offset - 128, 256, 256)
         )
-        image_crop = np.rollaxis(image_crop, 0, 3)
+
+        image_crop = np.moveaxis(image_crop, 0, -1)
 
     # Sometimes our point will be on the edge of a NAIP tile, and our windowed reader above
     # will not actually return a 256x256 chunk of data we could handle this nicely by going
@@ -157,5 +175,19 @@ if __name__ == "__main__":
         "output_dir", help="Path to out dir either locally or on Azure blob storage"
     )
     parser.add_argument("-t", "--threads", help="threads to use", type=int, default=1)
+    parser.add_argument(
+        "-c",
+        "--chunk-size",
+        help="size of chunk to process at once",
+        type=int,
+        default=5000,
+    )
+    parser.add_argument(
+        "-w",
+        "--workers",
+        help="Number of processes to use",
+        type=int,
+        default=os.cpu_count(),
+    )
     args = parser.parse_args()
-    main(args.input_path, args.output_dir, args.threads)
+    main(args.input_path, args.output_dir, args.workers, args.threads, args.chunk_size)
