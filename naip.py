@@ -5,7 +5,9 @@ Usage
 """
 import argparse
 import concurrent.futures
+import logging
 import os
+import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +24,10 @@ from rasterio.windows import Window
 
 from utils.naip import NAIPTileIndex
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+logger.addHandler(logging.StreamHandler(sys.stdout))
+
 # Workaround for a problem in older rasterio versions
 os.environ["CURL_CA_BUNDLE"] = "/etc/ssl/certs/ca-certificates.crt"
 
@@ -30,9 +36,6 @@ CRS = "EPSG:4326"
 # Storage locations are documented at http://aka.ms/ai4edata-naip
 NAIP_ROOT = "https://naipblobs.blob.core.windows.net/naip"
 
-# Location of mounted blob storage root dir
-# BLOB_STORAGE_DIR = '/home/datablob'
-
 
 def main(input_path, output_dir, workers, threads, chunk_size):
     # set up
@@ -40,7 +43,12 @@ def main(input_path, output_dir, workers, threads, chunk_size):
     os.makedirs(temp_dir, exist_ok=True)
     index = NAIPTileIndex(temp_dir)
 
-    print(f"Using {workers} workers with {threads} threads each")
+    logger.info(
+        "Using %d workers processing %d chunks with %d threads.",
+        workers,
+        chunk_size,
+        threads,
+    )
 
     with open(input_path, "r") as fobj:
         plots = DictReader(fobj)
@@ -56,9 +64,9 @@ def main(input_path, output_dir, workers, threads, chunk_size):
                 try:
                     future.result()
                 except Exception as e:
-                    print(e)
+                    logger.exception(e)
                 else:
-                    print(f"Finished chunk {future_to_chunk_idx[future]}")
+                    logger.info(f"Finished chunk {future_to_chunk_idx[future]}")
 
 
 def process_chunk(plots, index, output_dir, threads):
@@ -73,7 +81,7 @@ def process_chunk(plots, index, output_dir, threads):
             except Exception as e:
                 print(e)
             else:
-                print(f"Finished {future_to_index[future]}")
+                logger.debug("Finished %s", future_to_index[future])
 
 
 def chunk_iterable(iterable, size):
@@ -86,8 +94,6 @@ def get_and_write_tile(plot, index, output_dir):
     tile, state = get_plot_tile_and_state(plot, index)
     if tile is not None:
         write_tile(tile, plot, state, output_dir)
-    else:
-        print(f'No acceptable tile for {plot["INDEX"]}')
 
 
 def get_plot_tile_and_state(plot, index):
@@ -108,16 +114,14 @@ def get_plot_tile_and_state(plot, index):
     naip_files = index.lookup_tile(lat, lon)
 
     if naip_files is None or len(naip_files) == 0:
-        print(f'No intersection, skipping index {plot["INDEX"]}')
+        logger.info(f'No intersection, skipping index {plot["INDEX"]}')
         return None, None
 
-    # check for the matching or closest year
+    # Get closest year
     naip_years = np.array([int(n.split("/")[2]) for n in naip_files])
     closest = min(naip_years, key=lambda x: abs(x - query_year))
     match_idx = np.where(naip_years == closest)[0][0]
-    # We could do some more checking here to make sure that the file is from 2017 Maryland,
-    # but that's not the point
-    image_url = NAIP_ROOT + "/" + naip_files[match_idx]
+    image_url = f"{NAIP_ROOT}/{naip_files[match_idx]}"
 
     with rasterio.open(image_url) as f:
 
@@ -151,14 +155,14 @@ def get_plot_tile_and_state(plot, index):
         return image_crop, state
 
     else:
-        print(
+        logger.info(
             f"Our crop was likely at the edge of a NAIP tile, skipping point {plot['INDEX']}"
         )
         return None, None
 
 
 def write_tile(tile, plot, state, output_dir):
-    """Write tile to blob storage."""
+    """Write tile to local or blob storage."""
     write_dir = Path(output_dir) / state
     write_dir.mkdir(exist_ok=True)
     path = write_dir / f'{plot["INDEX"]}.tif'
