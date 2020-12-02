@@ -41,9 +41,9 @@ RUN curl -o /tmp/get_pip.py https://bootstrap.pypa.io/get-pip.py
 RUN python3.8 /tmp/get_pip.py
 
 COPY Makefile ./
-COPY requirements.txt ./
+COPY requirements-minimal.txt ./
 
-RUN python3.8 -m pip install -r requirements.txt
+RUN python3.8 -m pip install -r requirements-minimal.txt
 
 WORKDIR /code
 

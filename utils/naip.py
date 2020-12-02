@@ -53,7 +53,7 @@ class NAIPTileIndex:
             download_url(
                 index_blob_root + file_path,
                 base_path + "/" + file_path,
-                progress_updater=DownloadProgressBar(),
+                progress_updater=None,
             )
 
         self.base_path = base_path

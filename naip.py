@@ -10,10 +10,7 @@ import os
 import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures import ThreadPoolExecutor
 from csv import DictReader
-from itertools import chain
-from itertools import islice
 from pathlib import Path
 
 import fiona.transform
@@ -37,66 +34,55 @@ CRS = "EPSG:4326"
 NAIP_ROOT = "https://naipblobs.blob.core.windows.net/naip"
 
 
-def main(input_path, output_dir, workers, threads, chunk_size):
+def main(input_path, output_dir, workers):
     # set up
     temp_dir = os.path.join(tempfile.gettempdir(), "naip")
     os.makedirs(temp_dir, exist_ok=True)
     index = NAIPTileIndex(temp_dir)
 
-    logger.info(
-        "Using %d workers processing %d chunks with %d threads.",
-        workers,
-        chunk_size,
-        threads,
-    )
-
     with open(input_path, "r") as fobj:
         plots = DictReader(fobj)
-        chunks = chunk_iterable(plots, chunk_size)
-        with ProcessPoolExecutor(max_workers=workers) as ppexecutor:
-            future_to_chunk_idx = {
-                ppexecutor.submit(
-                    process_chunk, list(chunk), index, output_dir, threads
-                ): i
-                for i, chunk in enumerate(chunks)
-            }
-            for future in concurrent.futures.as_completed(future_to_chunk_idx):
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.exception(e)
-                else:
-                    logger.info(f"Finished chunk {future_to_chunk_idx[future]}")
-
-
-def process_chunk(plots, index, output_dir, threads):
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        future_to_index = {
-            executor.submit(get_and_write_tile, plot, index, output_dir): plot["INDEX"]
-            for plot in plots
-        }
+        plot_url_lst = [(plot, get_plot_url(plot, index)) for plot in plots]
+    print(len(plot_url_lst))
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        future_to_index = {}
+        for plot, url in plot_url_lst:
+            if url:
+                future_to_index[executor.submit(get_and_write_tile, plot, url, output_dir)] = plot["INDEX"]
         for future in concurrent.futures.as_completed(future_to_index):
             try:
                 future.result()
             except Exception as e:
-                print(e)
+                logger.exception(e)
             else:
                 logger.debug("Finished %s", future_to_index[future])
 
 
-def chunk_iterable(iterable, size):
-    itr = iter(iterable)
-    for first in itr:
-        yield chain([first], islice(itr, size - 1))
-
-
-def get_and_write_tile(plot, index, output_dir):
-    tile, state = get_plot_tile_and_state(plot, index)
+def get_and_write_tile(plot, url, output_dir):
+    tile, state = get_plot_tile_and_state(url, plot)
     if tile is not None:
         write_tile(tile, plot, state, output_dir)
 
 
-def get_plot_tile_and_state(plot, index):
+def get_plot_url(plot, index):
+    lon, lat = float(plot["LON"]), float(plot["LAT"])
+    query_year = int(float(plot["INVYR"]))
+
+    # Find the filenames that intersect with our lat/lon
+    naip_files = index.lookup_tile(lat, lon)
+
+    if naip_files is None or len(naip_files) == 0:
+        logger.info(f'No intersection, skipping index {plot["INDEX"]}')
+        return None
+
+    # Get closest year
+    naip_years = np.array([int(n.split("/")[2]) for n in naip_files])
+    closest = min(naip_years, key=lambda x: abs(x - query_year))
+    match_idx = np.where(naip_years == closest)[0][0]
+    return naip_files[match_idx]
+
+
+def get_plot_tile_and_state(image_url, plot):
     """Given a plot dictionary and the NAIP rtree index fetch the desired 256x256 image tile.
 
     Args:
@@ -108,22 +94,8 @@ def get_plot_tile_and_state(plot, index):
 
     """
     lon, lat = float(plot["LON"]), float(plot["LAT"])
-    query_year = int(float(plot["INVYR"]))
-
-    # Find the filenames that intersect with our lat/lon
-    naip_files = index.lookup_tile(lat, lon)
-
-    if naip_files is None or len(naip_files) == 0:
-        logger.info(f'No intersection, skipping index {plot["INDEX"]}')
-        return None, None
-
-    # Get closest year
-    naip_years = np.array([int(n.split("/")[2]) for n in naip_files])
-    closest = min(naip_years, key=lambda x: abs(x - query_year))
-    match_idx = np.where(naip_years == closest)[0][0]
-    image_url = f"{NAIP_ROOT}/{naip_files[match_idx]}"
-
-    with rasterio.open(image_url) as f:
+    full_url = f"{NAIP_ROOT}/{image_url}"
+    with rasterio.open(full_url) as f:
 
         # Convert our lat/lon point to the local NAIP coordinate system
         x_tile_crs, y_tile_crs = fiona.transform.transform(
@@ -151,7 +123,7 @@ def get_plot_tile_and_state(plot, index):
     # tile with the full window.
     if (image_crop.shape[0] == 256) and (image_crop.shape[1] == 256):
         # NAIP path [blob root]/v002/[state]/[year]/[state]_[resolution]_[year]/[quadrangle]/filename
-        state = naip_files[match_idx].split("/")[1]
+        state = image_url.split("/")[1]
         return image_crop, state
 
     else:
@@ -178,14 +150,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "output_dir", help="Path to out dir either locally or on Azure blob storage"
     )
-    parser.add_argument("-t", "--threads", help="threads to use", type=int, default=1)
-    parser.add_argument(
-        "-c",
-        "--chunk-size",
-        help="size of chunk to process at once",
-        type=int,
-        default=5000,
-    )
     parser.add_argument(
         "-w",
         "--workers",
@@ -194,4 +158,4 @@ if __name__ == "__main__":
         default=os.cpu_count(),
     )
     args = parser.parse_args()
-    main(args.input_path, args.output_dir, args.workers, args.threads, args.chunk_size)
+    main(args.input_path, args.output_dir, args.workers)
