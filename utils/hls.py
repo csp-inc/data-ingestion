@@ -123,11 +123,24 @@ class HLSCatalog:
         self.xr_ds = xr_ds
 
     def to_zarr(self, path):
+        self.xr_ds.attrs['bands'] = [
+            band.value
+            for band in self.xr_ds.attrs['bands']
+        ]
         self.xr_ds.to_zarr(path)
+        self.xr_ds.attrs['bands'] = [
+            HLSBand(value)
+            for value in self.xr_ds.attrs['bands']
+        ]
 
     @classmethod
     def from_zarr(cls, path):
-        cls(xr.open_zarr(path))
+        catalog = cls(xr.open_zarr(path)) 
+        catalog.xr_ds.attrs['bands'] = [
+            HLSBand(value)
+            for value in catalog.xr_ds.attrs['bands']
+        ]
+        return catalog
 
     @classmethod
     def from_point_pandas(cls, df, bands=[], tile_lookup=None):
