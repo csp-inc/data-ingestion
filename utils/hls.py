@@ -94,10 +94,16 @@ class HLSTileLookup:
         print('Read tile extents for {} tiles'.format(len(hls_tile_extents)))
         return hls_tile_extents
 
+    def get_point_hls_tile_ids(self, lat, lon):
+        return set(
+                self.idx_to_id[i] 
+                for i in self.tree_idx.intersection((lon, lat, lon, lat))
+        )
+
     def get_point_hls_tile_id(self, lat, lon):
-        results = list(self.tree_idx.intersection((lon, lat, lon, lat)))
+        results = self.get_point_hls_tile_ids
         if len(results) > 0:
-            return self.idx_to_id[results[0]]
+            return results[0]
         return None
 
     def get_bbox_hls_tile_ids(self, left, bottom, right, top):
@@ -128,38 +134,9 @@ class HLSCatalog:
     def from_zarr(cls, path):
         cls(xr.open_zarr(path))
 
-    @classmethod
-    def from_point_pandas(cls, df, bands=[], tile_lookup=None):
-        """
-        Args:
-            df (pandas.DataFrame): Dataframe with at least the following columns: lat, lon, year
-            landsat_bands list(str): list of landsat band names to fetch
-            sentinel_bands list(str): list of landsat band names to fetch
-        """
+    @classmethod 
+    def from_tiles(cls, tiles, years, bands, tile_lookup=None):
         lookup = tile_lookup if tile_lookup else HLSTileLookup()
-        df = df
-        df['tile'] = df.apply(lambda row: lookup.get_point_hls_tile_id(row.lat, row.lon), axis=1)
-        # join landsat and sentinel scenes
-        landsat = df.apply(lambda row: _list_scenes('L309', 'L30', row.tile, int(row.year)), axis=1)
-        sentinel = df.apply(lambda row: _list_scenes('S309', 'S30', row.tile, int(row.year)), axis=1)
-        df['scenes'] = landsat + sentinel
-        # filter out rows w/ empty scenes
-        df = df[df.scenes.astype(bool)]
-        # explode list of scenes into one row per scene
-        df = df.explode('scenes').rename({'scenes': 'scene'}, axis=1)
-        df['sensor'] = df.apply(lambda row: 'L' if 'L30' in row.scene else 'S', axis=1)
-        # get datetime for scene
-        df['dt'] = df.apply(lambda row: _scene_to_datetime(row.scene), axis=1)
-
-        # create xr_dataset
-        xr_ds = xr.Dataset.from_dataframe(df)
-        xr_ds.attrs['bands'] = bands
-        return cls(xr_ds)
-
-    @classmethod
-    def from_bbox(cls, bbox, years, bands=[], tile_lookup=None):
-        lookup = tile_lookup if tile_lookup else HLSTileLookup()
-        tiles = list(lookup.get_bbox_hls_tile_ids(*bbox))
         df = pd.DataFrame(tiles).rename({0: 'tile'}, axis=1)
         df['years'] = years * len(tiles)
         df = df.explode('years').rename({'years': 'year'}, axis=1)
@@ -178,6 +155,27 @@ class HLSCatalog:
         xr_ds = xr.Dataset.from_dataframe(df)
         xr_ds.attrs['bands'] = bands
         return cls(xr_ds)
+
+
+    @classmethod
+    def from_point_pandas(cls, df, bands=[], tile_lookup=None):
+        """
+        Args:
+            df (pandas.DataFrame): Dataframe with at least the following columns: lat, lon, year
+            landsat_bands list(str): list of landsat band names to fetch
+            sentinel_bands list(str): list of landsat band names to fetch
+        """
+        lookup = tile_lookup if tile_lookup else HLSTileLookup()
+        # eh?
+        df = df
+        tiles = df.apply(lambda row: lookup.get_point_hls_tile_id(row.lat, row.lon), axis=1)
+        return self.from_tiles(tiles, years, bands, tile_lookup)
+
+
+    @classmethod
+    def from_bbox(cls, bbox, years, bands=[], tile_lookup=None):
+        tiles = list(lookup.get_bbox_hls_tile_ids(*bbox))
+        return self.from_tiles(tiles, years, bands, tile_lookup)
 
 
 def fia_csv_to_data_catalog_input(path):
