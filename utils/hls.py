@@ -13,6 +13,7 @@ import requests
 import re
 import io
 from datetime import datetime
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -206,6 +207,7 @@ def _list_available_tiles(prefix, band="01"):
     return files
 
 
+@lru_cache(maxsize=10000)
 def _list_scenes(folder, product, tile, year):
     prefix = f'{folder}/HLS.{product}.T{tile}.{year}'
     urls = _list_available_tiles(prefix)
