@@ -175,7 +175,7 @@ class HLSCatalog:
         lookup = tile_lookup if tile_lookup else HLSTileLookup()
         tiles = list(lookup.get_bbox_hls_tile_ids(*bbox))
         df = pd.DataFrame(tiles).rename({0: 'tile'}, axis=1)
-        df['years'] = years * len(tiles)
+        df['years'] = [years] * len(tiles)
         df = df.explode('years').rename({'years': 'year'}, axis=1)
         # join landsat and sentinel scenes
         landsat = df.apply(lambda row: _list_scenes('L309', 'L30', row.tile, int(row.year)), axis=1)
