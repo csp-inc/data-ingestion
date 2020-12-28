@@ -154,8 +154,8 @@ class HLSCatalog:
         df = df
         df['tile'] = df.apply(lambda row: lookup.get_point_hls_tile_id(row.lat, row.lon), axis=1)
         # join landsat and sentinel scenes
-        landsat = df.apply(lambda row: _list_scenes('L309', 'L30', row.tile, int(row.year)), axis=1)
-        sentinel = df.apply(lambda row: _list_scenes('S309', 'S30', row.tile, int(row.year)), axis=1)
+        landsat = df.apply(lambda row: _list_scenes('L30', 'L30', row.tile, int(row.year)), axis=1)
+        sentinel = df.apply(lambda row: _list_scenes('S30', 'S30', row.tile, int(row.year)), axis=1)
         df['scenes'] = landsat + sentinel
         # filter out rows w/ empty scenes
         df = df[df.scenes.astype(bool)]
