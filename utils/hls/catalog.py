@@ -1,4 +1,4 @@
-"""Tools for getting HLS scenes and bands for bboxes/points.
+"""Tools for creating catalogs of HLS scenes and bands for bboxes/points
 
 Example usage:
 lookup = HLSTileLookup()
@@ -127,7 +127,7 @@ class HLSCatalog:
             band.value
             for band in self.xr_ds.attrs['bands']
         ]
-        self.xr_ds.to_zarr(path)
+        self.xr_ds.to_zarr(path, mode='w')
         self.xr_ds.attrs['bands'] = [
             HLSBand(value)
             for value in self.xr_ds.attrs['bands']
@@ -178,8 +178,8 @@ class HLSCatalog:
         df['years'] = [years] * len(tiles)
         df = df.explode('years').rename({'years': 'year'}, axis=1)
         # join landsat and sentinel scenes
-        landsat = df.apply(lambda row: _list_scenes('L309', 'L30', row.tile, int(row.year)), axis=1)
-        sentinel = df.apply(lambda row: _list_scenes('S309', 'S30', row.tile, int(row.year)), axis=1)
+        landsat = df.apply(lambda row: _list_scenes('L30', 'L30', row.tile, int(row.year)), axis=1)
+        sentinel = df.apply(lambda row: _list_scenes('S30', 'S30', row.tile, int(row.year)), axis=1)
         df['scenes'] = landsat + sentinel
         # filter out rows w/ empty scenes
         df = df[df.scenes.astype(bool)]
