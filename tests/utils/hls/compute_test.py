@@ -25,7 +25,7 @@ def test_get_mask():
     ]))
     
 
-def test_fetch_ban_url():
+def test_fetch_band_url():
     url = "https://hlssa.blob.core.windows.net/hls/S30/HLS.S30.T10TET.2019001.v1.4_02.tif"
     band = 'Blue'
     ds = compute.fetch_band_url(band, url, chunks={'band': 1, 'x': 256, 'y': 256})
@@ -34,6 +34,9 @@ def test_fetch_ban_url():
     assert ds.attrs['long_name'] == band
     assert isinstance(ds.data_vars[band], xr.DataArray)
     assert set(ds.coords) == {'x', 'y'}
+    # https://github.com/pydata/xarray/issues/4784
+    assert isinstance(ds.attrs['scale_factor'], float)
+    assert isinstance(ds.attrs['add_offset'], float)
     
 
 def test_get_scene_dataset(client):
@@ -44,7 +47,7 @@ def test_get_scene_dataset(client):
     chunks = {}
     future = compute.get_scene_dataset(scene, sensor, bands, band_names,  client, chunks)
     ds = future.result()
-    
+
     assert isinstance(future, Future)
     assert len(ds.attrs) > 0
     assert set(ds.data_vars.keys()) == set(band_names)

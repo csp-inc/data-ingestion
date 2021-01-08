@@ -46,6 +46,14 @@ def fetch_band_url(band, url, chunks):
     """
     da = xr.open_rasterio(url, chunks=chunks)
     da = da.squeeze().drop_vars('band')
+    # There is a bug in open_rasterio as it doesn't coerce scale_factor/add_offset to a float, but leaves it as a string.
+    # If you then save this file as a zarr it will save scale_factor/add_offset as a string
+    # when you try to re-open the zarr it will crash trying to apply the scale factor + add offset
+    # https://github.com/pydata/xarray/issues/4784
+    if 'scale_factor' in da.attrs:
+        da.attrs['scale_factor'] = float(da.attrs['scale_factor'])
+    if 'add_offset' in da.attrs:
+        da.attrs['add_offset'] = float(da.attrs['add_offset'])
     return da.to_dataset(name=band, promote_attrs=True)
 
 def get_scene_dataset(scene, sensor, bands, band_names, client, chunks):
@@ -104,7 +112,7 @@ def compute_tile_median(ds, groupby, qa_name):
         .where(ds <= 10000)
         .where(ds >= 0)
         .groupby(groupby)
-        .median()
+        .median(keep_attrs=True)
         .chunk({'month': 1, 'y': 3660, 'x': 3660})  # groupby + median changes chunk size...lets change it back
     )
 
