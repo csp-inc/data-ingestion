@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: image install install-dev clean test-local test-docker pre-commit
+.PHONY: test
 
 test:
-    pytest tests
+	pytest tests
