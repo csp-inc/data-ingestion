@@ -32,29 +32,58 @@ def get_mask(qa_band):
     return xr.where(is_bad_quality(qa_band), False, True)  # True where is_bad_quality is False, False where is_bad_quality is True
 
 
-def fetch_band_url(tpl, chunks):
+def fetch_band_url(band, url, chunks):
     """Fetch a given url with xarray, creating a dataset with a single data variable of the band name for the url.
     
     Args:
-        tpl (Tuple[str, str]): tuple of the form (band, url) - the url to fetch and the band name for the data variable
+        band (str): the band name for the data variable
+        url (str): the url to fetch
         chunks (Dict[str, int]): How to chunk HLS input data
         
     Returns:
         xarray.Dataset: Dataset for the given HLS scene url with the data variable being named the given band
         
     """
-    band, url = tpl
     da = xr.open_rasterio(url, chunks=chunks)
-    da = da.squeeze().drop(labels='band')
-    return da.to_dataset(name=band)
+    da = da.squeeze().drop_vars('band')
+    return da.to_dataset(name=band, promote_attrs=True)
 
-
-def compute_tile_median(job_id, ds, groupby, qa_name, write_store):
-    """Compute QA-band-masked {groupby} median reflectance for the given dataset and save the result as zarr to `write_store`.
+def get_scene_dataset(scene, sensor, bands, band_names, client, chunks):
+    """For a given scene/sensor combination and list of bands + names, build a dataset using the dask client.
     
     Args:
-        job_id (str): The job_id of the tile being computed
-        ds (xarray.Dataset): Dataset to compute on
+        scene (str): String compatible with `scene_to_urls` specifying a single satellite capture of an HLS tile
+        sensor (str): 'S' (Sentinel) or 'L' (Landsat) - what sensor the scene came from
+        bands (List[HLSBand]): List of HLSBands to include in the dataset as data variables
+        band_names (List[str]): Names of the bands, used to name each data variable
+        client (dask.distributed.client): Client to submit functions to
+        chunks (dict[str, int]): How to chunk the data across workers in dask
+    """
+    scenes = scene_to_urls(scene, sensor, bands)
+    # list of datasets, one for each band, that need to be xr.merge'd (futures)
+    band_ds_futures = client.map(
+        fetch_band_url,
+        band_names,
+        scenes,
+        chunks=chunks,
+        priority=-5,
+        retries=1
+    )
+    # single dataset with every band (future)
+    return client.submit(
+        xr.merge,
+        band_ds_futures,
+        combine_attrs='override',  # first band's attributes will be used
+        priority=-4,
+        retries=1
+    )
+
+
+def compute_tile_median(ds, groupby, qa_name):
+    """Compute QA-band-masked {groupby} median reflectance for the given dataset.
+    
+    Args:
+        ds (xarray.Dataset): Dataset to compute on with dimensions 'time', 'x', and 'y'
         groupby (str): How to group the dataset (e.g. "time.month")
         qa_name (str): Name of the QA band to use for masking
         write_store (fsspec.FSMap): The location to write the zarr
@@ -70,14 +99,28 @@ def compute_tile_median(job_id, ds, groupby, qa_name, write_store):
             .drop_vars(qa_name)  # drop QA band
             .where(qa_mask)  # Apply mask
         )
-    zarr = (ds
+    return (ds
         .where(ds != -1000)  # -1000 means no data - set those entries to nan
         .groupby(groupby)
         .median()
         .chunk({'month': 1, 'y': 3660, 'x': 3660})  # groupby + median changes chunk size...lets change it back
-        .to_zarr(write_store, mode='w')
     )
-    return job_id
+
+
+def save_to_zarr(ds, write_store, mode, success_value):
+    """Save given dataset to zarr.
+    
+    Args:
+        ds (xarray.Dataset): dataset to save
+        write_store (fsspec.FSMap): destination to save ds to
+        mode (str): what mode to use for writing, see http://xarray.pydata.org/en/stable/generated/xarray.Dataset.to_zarr.html?highlight=to_zarr
+        success_value (Any): what to return when write is succesful
+        
+    Returns:
+        Any: the provided success_value
+    """
+    ds.to_zarr(write_store, mode=mode)
+    return success_value
 
 
 def calculate_job_median(job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, client):
@@ -99,24 +142,48 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, band_names, qa_band
         
     """
     
-    # create partial function for concatenating individual scene ds into single ds
-    concat_time_dim = partial(xr.concat, dim=pd.DatetimeIndex(job_df['dt'].tolist(), name='time'))
-    
-    # create partial function for applying fetch_band_url with chunks
-    fetch_band_url_partial = partial(fetch_band_url, chunks=chunks)
-    
     scene_ds_futures = []
     for _, row in job_df.iterrows():
-        scenes = scene_to_urls(row['scene'], row['sensor'], bands)
-        # list of datasets that need to be xr.merge'd (future)
-        band_ds_futures = client.map(fetch_band_url_partial, list(zip(band_names, scenes)), priority=-5, retries=1)
         # single dataset with every band (future)
-        scene_ds_futures.append(client.submit(xr.merge, band_ds_futures, priority=-4, retries=1))
+        scene_ds_futures.append(
+            get_scene_dataset(
+                scene=row['scene'],
+                sensor=row['sensor'],
+                bands=bands,
+                band_names=band_names,
+                chunks=chunks,
+                client=client
+            )
+        )
         
     # dataset of a single index/tile with a data var for every band and dimensions: x, y, time
-    job_ds_future = client.submit(concat_time_dim, scene_ds_futures, priority=-3, retries=1)
+    job_ds_future = client.submit(
+        xr.concat,
+        scene_ds_futures,
+        dim=pd.DatetimeIndex(job_df['dt'].tolist(), name='time'),
+        combine_attrs='override',  # use first dataset's attributes
+        priority=-3,
+        retries=1
+    )
     # compute masked, monthly, median per band per pixel
-    return client.submit(compute_tile_median, job_id, job_ds_future, job_groupby, qa_band_name, write_store, priority=-2, retries=1)
+    median = client.submit(
+        compute_tile_median,
+        job_ds_future,
+        job_groupby,
+        qa_band_name,
+        priority=-2,
+        retries=1
+    )
+    # save to zarr
+    return client.submit(
+        save_to_zarr,
+        median,
+        write_store,
+        'w',
+        job_id,
+        priority=-1,
+        retries=1,
+    )
 
 
 def process_catalog(

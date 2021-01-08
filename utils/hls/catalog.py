@@ -112,7 +112,7 @@ class HLSCatalog:
     """Wrapper around an xarray dataset.
 
     Contains `self.xr_ds` which is an xarray dataset with at least:
-        variables of: tile, scene, sensor, dt (datetime)
+        variables of: tile (string HLS tile id), scene, sensor, dt (datetime)
         attrs: desired bands
 
     Includes utility functions for constructing catalog from a pandas dataframe of training points or a bbox.
@@ -147,8 +147,7 @@ class HLSCatalog:
         """
         Args:
             df (pandas.DataFrame): Dataframe with at least the following columns: lat, lon, year
-            landsat_bands list(str): list of landsat band names to fetch
-            sentinel_bands list(str): list of landsat band names to fetch
+            bands list(HLSBand): list of bands to fetch
         """
         lookup = tile_lookup if tile_lookup else HLSTileLookup()
         df = df
