@@ -100,7 +100,9 @@ def compute_tile_median(ds, groupby, qa_name):
             .where(qa_mask)  # Apply mask
         )
     return (ds
-        .where(ds != -1000)  # -1000 means no data - set those entries to nan
+        # valid range is 0-10000 per LaSRC v3 guide: https://prd-wret.s3.us-west-2.amazonaws.com/assets/palladium/production/atoms/files/LSDS-1368_L8_C1-LandSurfaceReflectanceCode-LASRC_ProductGuide-v3.pdf
+        .where(ds <= 10000)
+        .where(ds >= 0)
         .groupby(groupby)
         .median()
         .chunk({'month': 1, 'y': 3660, 'x': 3660})  # groupby + median changes chunk size...lets change it back

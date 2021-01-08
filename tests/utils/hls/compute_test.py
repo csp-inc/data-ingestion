@@ -53,9 +53,9 @@ def test_get_scene_dataset(client):
 def test_compute_tile_median():
     band = xr.DataArray(
         [
-            [[1, 2, 3], [-1000, 5, 6]],
+            [[1, 2, 3], [-1, 5, 6]],
             [[2, 3, 4], [5, -1000, 7]],
-            [[3, 4, 5], [6, 7, -1000]],
+            [[3, 4, 5], [6, 7, 10001]],
             [[4, 5, 6], [7, 8, 9]],
         ],
         dims=['time', 'x', 'y'],
