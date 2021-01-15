@@ -1,3 +1,4 @@
+import json
 import time
 from functools import partial
 
@@ -196,6 +197,19 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, band_names, qa_band
     )
 
 
+def _read_checkpoints(path, logger):
+    """
+    """
+    try:
+        with open(path, 'r') as f:
+            return set(f.read().splitlines())
+    except FileNotFoundError:
+        logger.warning('No checkpoint file found, creating it at %s', path)
+        with open(path, 'x') as f:
+            pass
+        return []
+
+    
 def process_catalog(
     catalog,
     catalog_groupby,
@@ -207,6 +221,7 @@ def process_catalog(
     account_key,
     client,
     concurrency,
+    checkpoint_path,
     logger,
 ):
     """Process a catalog.
@@ -222,6 +237,7 @@ def process_catalog(
         account_key (str): Azure account key for the `account_name` which results are written to
         client (dask.distributed.Client): Dask cluster client to submit tasks to
         concurrency (int): Number of jobs to have running on the Dask cluster at once, must be >0
+        checkpoint_path (str): Path to a local file for reading and updating checkpoints
         logger (logging.Logger): Logger to log info to.
         
     """
@@ -233,10 +249,21 @@ def process_catalog(
     first_futures = []
     start_time = time.perf_counter()
     jobs = list(df.groupby(catalog_groupby))
-    num_jobs = len(jobs)
+    checkpoints = _read_checkpoints(checkpoint_path, logger)
     
-    while len(first_futures) < concurrency:
+    metrics = dict(
+        job_errors=0,
+        job_skips=0,
+        job_completes=0
+    )
+
+    # submit first set of jobs
+    while len(first_futures) < concurrency and len(jobs) > 0:
         job_id, job_df = jobs.pop(0)
+        if str(job_id) in checkpoints:
+            logger.info(f"Skipping checkpointed job {job_id}")
+            metrics['job_skips'] += 1
+            continue
         logger.info(f"Submitting job {job_id}")
         write_store = fsspec.get_mapper(
             f"az://{storage_container}/{job_id}.zarr",
@@ -247,15 +274,28 @@ def process_catalog(
             job_fn(job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, client)
         )
     
+    # wait on completed jobs
     ac = as_completed(first_futures)
     for future in ac:
         try:
             result = future.result()
             logger.info(f"Completed job {result}")
+            metrics['job_completes'] += 1
+            with open(checkpoint_path, 'a') as checkpoint_file:
+                checkpoint_file.write(str(result) + '\n')
         except Exception as e:
             logger.exception("Exception from dask cluster")
-        if len(jobs) > 0:
+            metrics['job_errors'] += 1
+        # Find a job that hasn't been completed and start it
+        already_done = True
+        while already_done and len(jobs) > 0:
             job_id, job_df = jobs.pop(0)
+            if str(job_id) in checkpoints:
+                logger.info(f"Skipping checkpointed job {job_id}")
+                metrics['job_skips'] += 1
+                continue
+            already_done = False
+            # submit job
             logger.info(f"Submitting job {job_id}")
             write_store = fsspec.get_mapper(
                 f"az://{storage_container}/{job_id}.zarr",
@@ -265,4 +305,5 @@ def process_catalog(
             ac.add(
                 job_fn(job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, client)
             )
-    logger.info(f"{num_jobs} completed in {time.perf_counter()-start_time} seconds")
+    metrics['time'] = time.perf_counter()-start_time
+    logger.info(f"Metrics: {json.dumps(metrics)}")
