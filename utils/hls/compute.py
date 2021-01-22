@@ -8,7 +8,7 @@ import xarray as xr
 from dask.distributed import as_completed
 
 from utils.dask import create_cluster
-from utils.dask import upload_source
+from utils.dask import zip_code
 from utils.hls.catalog import HLSBand
 from utils.hls.catalog import scene_to_urls
 
@@ -290,6 +290,9 @@ def process_catalog(
 
     assert cluster_restart_freq > concurrency or cluster_restart_freq == -1, "cluster_restart_freq must be greater than concurrency or -1"
     
+    # zip code if provided
+    zipped_path = zip_code(code_path) if code_path else None
+    
     # set up band information from catalog
     bands = catalog.attrs['bands']
     band_names = [band.name for band in bands]
@@ -323,9 +326,9 @@ def process_catalog(
         with create_cluster(**cluster_args) as cluster:
             logger.info("Cluster dashboard visible at %s", cluster.dashboard_link)
             cluster_client = cluster.get_client()
-            if code_path:
+            if zipped_path:
                 logger.info("Uploading code to cluster")
-                upload_source(code_path, cluster_client)
+                cluster_client.upload_file(zipped_path)
             run_job_subset(subset, cluster_client)
     
     metrics['time'] = time.perf_counter()-start_time
