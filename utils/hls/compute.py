@@ -241,11 +241,11 @@ def process_catalog(
         logger (logging.Logger): Logger to log info to.
         
     """
-    bands = catalog.attrs['bands']
-    band_names = [band.name for band in bands]
-    qa_band_name = HLSBand.QA.name
+#    bands = catalog.attrs['bands']
+#    band_names = [band.name for band in bands]
+#    qa_band_name = HLSBand.QA.name
 
-    df = catalog.to_dataframe()
+    df = catalog
     first_futures = []
     start_time = time.perf_counter()
     jobs = list(df.groupby(catalog_groupby))
@@ -271,7 +271,7 @@ def process_catalog(
             account_key=account_key
         )
         first_futures.append(
-            job_fn(job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, client)
+            job_fn(job_id, job_df, job_groupby, chunks, write_store, client)
         )
     
     # wait on completed jobs
@@ -303,7 +303,7 @@ def process_catalog(
                 account_key=account_key
             )
             ac.add(
-                job_fn(job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, client)
+                job_fn(job_id, job_df, job_groupby, chunks, write_store, client)
             )
     metrics['time'] = time.perf_counter()-start_time
     logger.info(f"Metrics: {json.dumps(metrics)}")
