@@ -2,6 +2,7 @@ import json
 import time
 from functools import partial
 
+import  dask
 import fsspec
 import pandas as pd
 import xarray as xr
@@ -35,6 +36,7 @@ def get_mask(qa_band):
     return xr.where(is_bad_quality(qa_band), False, True)  # True where is_bad_quality is False, False where is_bad_quality is True
 
 
+@dask.delayed
 def fetch_band_url(band, url, chunks):
     """Fetch a given url with xarray, creating a dataset with a single data variable of the band name for the url.
     
@@ -59,7 +61,9 @@ def fetch_band_url(band, url, chunks):
         da.attrs['add_offset'] = float(da.attrs['add_offset'])
     return da.to_dataset(name=band, promote_attrs=True)
 
-def get_scene_dataset(scene, sensor, bands, band_names, client, chunks):
+
+@dask.delayed
+def get_scene_dataset(scene, sensor, bands, band_names, chunks):
     """For a given scene/sensor combination and list of bands + names, build a dataset using the dask client.
     
     Args:
@@ -70,23 +74,17 @@ def get_scene_dataset(scene, sensor, bands, band_names, client, chunks):
         client (dask.distributed.client): Client to submit functions to
         chunks (dict[str, int]): How to chunk the data across workers in dask
     """
-    scenes = scene_to_urls(scene, sensor, bands)
     # list of datasets, one for each band, that need to be xr.merge'd (futures)
-    band_ds_futures = client.map(
-        fetch_band_url,
-        band_names,
-        scenes,
-        chunks=chunks,
-        priority=-5,
-        retries=1
-    )
+    scenes = scene_to_urls(scene, sensor, bands)
+    band_datasets = [
+        fetch_band_url(band, scene, chunks=chunks)
+        for band, scene in zip(band_names, scenes)
+    ]
+
     # single dataset with every band (future)
-    return client.submit(
-        xr.merge,
-        band_ds_futures,
+    return xr.merge(
+        dask.compute(*band_datasets),
         combine_attrs='override',  # first band's attributes will be used
-        priority=-4,
-        retries=1
     )
 
 
@@ -136,7 +134,7 @@ def save_to_zarr(ds, write_store, mode, success_value):
     return success_value
 
 
-def calculate_job_median(job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, client):
+def calculate_job_median(job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store):
     """A job compatible with `process_catalog` which computes per-band median reflectance for the input job_df.
     
     Args:
@@ -148,54 +146,43 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, band_names, qa_band
         qa_band_name (str): Name of the QA band to use for masking
         chunks (Dict[str, int]): How to chunk HLS input data
         write_store (fsspec.FSMap): The location to write any results
-        client (dask.distributed.Client): Dask cluster client to submit tasks to
         
     Returns:
-        dask.distributed.Future: Future for the computation that is being done, can be waited on.
+        Any: Result of the computation to be passed back to process_catalog
         
     """
     
-    scene_ds_futures = []
+    scene_datasets = []
     for _, row in job_df.iterrows():
-        # single dataset with every band (future)
-        scene_ds_futures.append(
+        # single dataset with every band
+        scene_datasets.append(
             get_scene_dataset(
                 scene=row['scene'],
                 sensor=row['sensor'],
                 bands=bands,
                 band_names=band_names,
-                chunks=chunks,
-                client=client
+                chunks=chunks
             )
         )
-        
+
     # dataset of a single index/tile with a data var for every band and dimensions: x, y, time
-    job_ds_future = client.submit(
-        xr.concat,
-        scene_ds_futures,
+    job_ds_future = xr.concat(
+        dask.compute(*scene_datasets),
         dim=pd.DatetimeIndex(job_df['dt'].tolist(), name='time'),
-        combine_attrs='override',  # use first dataset's attributes
-        priority=-3,
-        retries=1
+        combine_attrs='override',
     )
     # compute masked, monthly, median per band per pixel
-    median = client.submit(
-        compute_tile_median,
+    median = compute_tile_median(
         job_ds_future,
         job_groupby,
         qa_band_name,
-        priority=-2,
-        retries=1
     )
     # save to zarr
-    return client.submit(
-        save_to_zarr,
+    return save_to_zarr(
         median,
         write_store,
         'w',
         job_id,
-        priority=-1,
-        retries=1,
     )
 
 
@@ -260,7 +247,7 @@ def process_catalog(
                 account_key=account_key
             )
             first_futures.append(
-                job_fn(job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, client)
+                client.submit(job_fn, job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store)
             )
 
         # wait on completed jobs
@@ -285,7 +272,7 @@ def process_catalog(
                     account_key=account_key
                 )
                 ac.add(
-                    job_fn(job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, client)
+                    client.submit(job_fn, job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store)
                 )
 
     assert cluster_restart_freq > concurrency or cluster_restart_freq == -1, "cluster_restart_freq must be greater than concurrency or -1"
