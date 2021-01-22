@@ -253,10 +253,6 @@ def process_catalog(
         # submit first set of jobs
         while len(first_futures) < concurrency and len(job_subset) > 0:
             job_id, job_df = job_subset.pop(0)
-            if str(job_id) in checkpoints:
-                logger.info(f"Skipping checkpointed job {job_id}")
-                metrics['job_skips'] += 1
-                continue
             logger.info(f"Submitting job {job_id}")
             write_store = fsspec.get_mapper(
                 f"az://{storage_container}/{job_id}.zarr",
@@ -279,16 +275,9 @@ def process_catalog(
             except Exception as e:
                 logger.exception("Exception from dask cluster")
                 metrics['job_errors'] += 1
-            # Find a job that hasn't been completed and start it
-            already_done = True
-            while already_done and len(job_subset) > 0:
+            # submit another job
+            if len(job_subset) > 0:
                 job_id, job_df = job_subset.pop(0)
-                if str(job_id) in checkpoints:
-                    logger.info(f"Skipping checkpointed job {job_id}")
-                    metrics['job_skips'] += 1
-                    continue
-                already_done = False
-                # submit job
                 logger.info(f"Submitting job {job_id}")
                 write_store = fsspec.get_mapper(
                     f"az://{storage_container}/{job_id}.zarr",
@@ -316,8 +305,15 @@ def process_catalog(
     
     # set up catalog, jobs, and checkpoints
     df = catalog.to_dataframe()
-    jobs = list(df.groupby(catalog_groupby))
     checkpoints = _read_checkpoints(checkpoint_path, logger)
+    jobs = []
+    for job_id, job in df.groupby(catalog_groupby):
+        if job_id in checkpoints:
+            logger.info(f"Skipping checkpointed job {job_id}")
+            metrics['job_skips'] += 1
+        else:
+            jobs.append((job_id, job))
+
     if cluster_restart_freq == -1:
         cluster_restart_freq = len(jobs)
     
