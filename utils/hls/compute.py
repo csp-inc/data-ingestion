@@ -247,7 +247,7 @@ def process_catalog(
                 account_key=account_key
             )
             first_futures.append(
-                client.submit(job_fn, job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store)
+                client.submit(job_fn, job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, retries=1)
             )
 
         # wait on completed jobs
@@ -272,7 +272,7 @@ def process_catalog(
                     account_key=account_key
                 )
                 ac.add(
-                    client.submit(job_fn, job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store)
+                    client.submit(job_fn, job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, retries=1)
                 )
 
     assert cluster_restart_freq > concurrency or cluster_restart_freq == -1, "cluster_restart_freq must be greater than concurrency or -1"
