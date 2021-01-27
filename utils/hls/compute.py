@@ -134,7 +134,7 @@ def save_to_zarr(ds, write_store, mode, success_value):
     return success_value
 
 
-def calculate_job_median(job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store):
+def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_name, storage_container, account_key):
     """A job compatible with `process_catalog` which computes per-band median reflectance for the input job_df.
     
     Args:
@@ -142,15 +142,22 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, band_names, qa_band
         job_df (pandas.Dataframe): Dataframe of scenes to include in the computation
         job_groupby (str): How to group the dataset produced from the dataframe (e.g. "time.month")
         bands (List[HLSBand]): List of HLSBand objects to compute median reflectance on
-        band_names (List[str]): List of band name strings
-        qa_band_name (str): Name of the QA band to use for masking
         chunks (Dict[str, int]): How to chunk HLS input data
-        write_store (fsspec.FSMap): The location to write any results
+        account_name (str): Azure storage account to write results to
+        storage_container (str): Azure storage container within the `account_name` to write results to
+        account_key (str): Azure account key for the `account_name` which results are written to
         
     Returns:
         Any: Result of the computation to be passed back to process_catalog
         
     """
+    write_store = fsspec.get_mapper(
+        f"az://{storage_container}/{job_id}.zarr",
+        account_name=account_name,
+        account_key=account_key
+    )
+    band_names = [band.name for band in bands]
+    qa_band_name = HLSBand.QA.name
     
     scene_datasets = []
     for _, row in job_df.iterrows():
@@ -203,17 +210,13 @@ def process_catalog(
     catalog,
     catalog_groupby,
     job_fn,
-    job_groupby,
-    chunks,
-    account_name,
-    storage_container,
-    account_key,
     concurrency,
     checkpoint_path,
     logger,
     cluster_args,
     code_path=None,
     cluster_restart_freq=-1,
+    **kwargs
 ):
     """Process a catalog. This function handles job submission, checkpointing successful jobs, managing job concurrency, and cluster management.
     
@@ -221,11 +224,6 @@ def process_catalog(
         catalog (xarray.Dataset): catalog to process
         catalog_groupby (str): column to group the catalog in to jobs by (e.g. 'INDEX', 'tile')
         job_fn: a function to apply to each job from the grouped catalog (e.g. `calculate_job_median`)
-        job_groupby (str): how to group data built within each job (e.g. 'time.month', 'time.year')
-        chunks (Dict[str, int]): How to chunk HLS input data
-        account_name (str): Azure storage account to write results to
-        storage_container (str): Azure storage container within the `account_name` to write results to
-        account_key (str): Azure account key for the `account_name` which results are written to
         concurrency (int): Number of jobs to have running on the Dask cluster at once, must be >0
         checkpoint_path (str): Path to a local file for reading and updating checkpoints
         logger (logging.Logger): Logger to log info to.
@@ -241,13 +239,8 @@ def process_catalog(
         while len(first_futures) < concurrency and len(job_subset) > 0:
             job_id, job_df = job_subset.pop(0)
             logger.info(f"Submitting job {job_id}")
-            write_store = fsspec.get_mapper(
-                f"az://{storage_container}/{job_id}.zarr",
-                account_name=account_name,
-                account_key=account_key
-            )
             first_futures.append(
-                client.submit(job_fn, job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, retries=1)
+                client.submit(job_fn, job_id, job_df, **kwargs, retries=1)
             )
 
         # wait on completed jobs
@@ -266,24 +259,14 @@ def process_catalog(
             if len(job_subset) > 0:
                 job_id, job_df = job_subset.pop(0)
                 logger.info(f"Submitting job {job_id}")
-                write_store = fsspec.get_mapper(
-                    f"az://{storage_container}/{job_id}.zarr",
-                    account_name=account_name,
-                    account_key=account_key
-                )
                 ac.add(
-                    client.submit(job_fn, job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, retries=1)
+                    client.submit(job_fn, job_id, job_df, **kwargs, retries=1)
                 )
 
     assert cluster_restart_freq > concurrency or cluster_restart_freq == -1, "cluster_restart_freq must be greater than concurrency or -1"
     
     # zip code if provided
     zipped_path = zip_code(code_path) if code_path else None
-    
-    # set up band information from catalog
-    bands = catalog.attrs['bands']
-    band_names = [band.name for band in bands]
-    qa_band_name = HLSBand.QA.name
 
     # start metrics
     metrics = dict(
