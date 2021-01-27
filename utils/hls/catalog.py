@@ -95,11 +95,9 @@ class HLSTileLookup:
         print('Read tile extents for {} tiles'.format(len(hls_tile_extents)))
         return hls_tile_extents
 
-    def get_point_hls_tile_id(self, lat, lon):
+    def get_point_hls_tile_ids(self, lat, lon):
         results = list(self.tree_idx.intersection((lon, lat, lon, lat)))
-        if len(results) > 0:
-            return self.idx_to_id[results[0]]
-        return None
+        return set([self.idx_to_id[r] for r in results])
 
     def get_bbox_hls_tile_ids(self, left, bottom, right, top):
         return set(
@@ -143,7 +141,7 @@ class HLSCatalog:
         return catalog
 
     @classmethod
-    def from_point_pandas(cls, df, bands=[], tile_lookup=None):
+    def from_point_pandas(cls, df, bands=[], tile_lookup=None, include_scenes=True):
         """
         Args:
             df (pandas.DataFrame): Dataframe with at least the following columns: lat, lon, year
@@ -151,18 +149,21 @@ class HLSCatalog:
         """
         lookup = tile_lookup if tile_lookup else HLSTileLookup()
         df = df
-        df['tile'] = df.apply(lambda row: lookup.get_point_hls_tile_id(row.lat, row.lon), axis=1)
-        # join landsat and sentinel scenes
-        landsat = df.apply(lambda row: _list_scenes('L30', 'L30', row.tile, int(row.year)), axis=1)
-        sentinel = df.apply(lambda row: _list_scenes('S30', 'S30', row.tile, int(row.year)), axis=1)
-        df['scenes'] = landsat + sentinel
-        # filter out rows w/ empty scenes
-        df = df[df.scenes.astype(bool)]
-        # explode list of scenes into one row per scene
-        df = df.explode('scenes').rename({'scenes': 'scene'}, axis=1)
-        df['sensor'] = df.apply(lambda row: 'L' if 'L30' in row.scene else 'S', axis=1)
-        # get datetime for scene
-        df['dt'] = df.apply(lambda row: _scene_to_datetime(row.scene), axis=1)
+        df['tile'] = df.apply(lambda row: lookup.get_point_hls_tile_ids(row.lat, row.lon), axis=1)
+        df = df.explode('tile')
+
+        if include_scenes:
+            # join landsat and sentinel scenes
+            landsat = df.apply(lambda row: _list_scenes('L30', 'L30', row.tile, int(row.year)), axis=1)
+            sentinel = df.apply(lambda row: _list_scenes('S30', 'S30', row.tile, int(row.year)), axis=1)
+            df['scenes'] = landsat + sentinel
+            # filter out rows w/ empty scenes
+            df = df[df.scenes.astype(bool)]
+            # explode list of scenes into one row per scene
+            df = df.explode('scenes').rename({'scenes': 'scene'}, axis=1)
+            df['sensor'] = df.apply(lambda row: 'L' if 'L30' in row.scene else 'S', axis=1)
+            # get datetime for scene
+            df['dt'] = df.apply(lambda row: _scene_to_datetime(row.scene), axis=1)
 
         # create xr_dataset
         xr_ds = xr.Dataset.from_dataframe(df)
@@ -170,23 +171,24 @@ class HLSCatalog:
         return cls(xr_ds)
 
     @classmethod
-    def from_bbox(cls, bbox, years, bands=[], tile_lookup=None):
+    def from_bbox(cls, bbox, years, bands=[], tile_lookup=None, include_scenes=True):
         lookup = tile_lookup if tile_lookup else HLSTileLookup()
         tiles = list(lookup.get_bbox_hls_tile_ids(*bbox))
         df = pd.DataFrame(tiles).rename({0: 'tile'}, axis=1)
         df['years'] = [years] * len(tiles)
         df = df.explode('years').rename({'years': 'year'}, axis=1)
-        # join landsat and sentinel scenes
-        landsat = df.apply(lambda row: _list_scenes('L30', 'L30', row.tile, int(row.year)), axis=1)
-        sentinel = df.apply(lambda row: _list_scenes('S30', 'S30', row.tile, int(row.year)), axis=1)
-        df['scenes'] = landsat + sentinel
-        # filter out rows w/ empty scenes
-        df = df[df.scenes.astype(bool)]
-        # explode list of scenes into one row per scene
-        df = df.explode('scenes').rename({'scenes': 'scene'}, axis=1)
-        df['sensor'] = df.apply(lambda row: 'L' if 'L30' in row.scene else 'S', axis=1)
-        # get datetime for scene
-        df['dt'] = df.apply(lambda row: _scene_to_datetime(row.scene), axis=1)
+        if include_scenes:
+            # join landsat and sentinel scenes
+            landsat = df.apply(lambda row: _list_scenes('L30', 'L30', row.tile, int(row.year)), axis=1)
+            sentinel = df.apply(lambda row: _list_scenes('S30', 'S30', row.tile, int(row.year)), axis=1)
+            df['scenes'] = landsat + sentinel
+            # filter out rows w/ empty scenes
+            df = df[df.scenes.astype(bool)]
+            # explode list of scenes into one row per scene
+            df = df.explode('scenes').rename({'scenes': 'scene'}, axis=1)
+            df['sensor'] = df.apply(lambda row: 'L' if 'L30' in row.scene else 'S', axis=1)
+            # get datetime for scene
+            df['dt'] = df.apply(lambda row: _scene_to_datetime(row.scene), axis=1)
         # create xr_dataset
         xr_ds = xr.Dataset.from_dataframe(df)
         xr_ds.attrs['bands'] = bands

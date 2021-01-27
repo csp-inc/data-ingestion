@@ -2,11 +2,14 @@ import json
 import time
 from functools import partial
 
+import  dask
 import fsspec
 import pandas as pd
 import xarray as xr
 from dask.distributed import as_completed
 
+from utils.dask import create_cluster
+from utils.dask import zip_code
 from utils.hls.catalog import HLSBand
 from utils.hls.catalog import scene_to_urls
 
@@ -33,6 +36,7 @@ def get_mask(qa_band):
     return xr.where(is_bad_quality(qa_band), False, True)  # True where is_bad_quality is False, False where is_bad_quality is True
 
 
+@dask.delayed
 def fetch_band_url(band, url, chunks):
     """Fetch a given url with xarray, creating a dataset with a single data variable of the band name for the url.
     
@@ -57,7 +61,9 @@ def fetch_band_url(band, url, chunks):
         da.attrs['add_offset'] = float(da.attrs['add_offset'])
     return da.to_dataset(name=band, promote_attrs=True)
 
-def get_scene_dataset(scene, sensor, bands, band_names, client, chunks):
+
+@dask.delayed
+def get_scene_dataset(scene, sensor, bands, band_names, chunks):
     """For a given scene/sensor combination and list of bands + names, build a dataset using the dask client.
     
     Args:
@@ -68,23 +74,17 @@ def get_scene_dataset(scene, sensor, bands, band_names, client, chunks):
         client (dask.distributed.client): Client to submit functions to
         chunks (dict[str, int]): How to chunk the data across workers in dask
     """
-    scenes = scene_to_urls(scene, sensor, bands)
     # list of datasets, one for each band, that need to be xr.merge'd (futures)
-    band_ds_futures = client.map(
-        fetch_band_url,
-        band_names,
-        scenes,
-        chunks=chunks,
-        priority=-5,
-        retries=1
-    )
+    scenes = scene_to_urls(scene, sensor, bands)
+    band_datasets = [
+        fetch_band_url(band, scene, chunks=chunks)
+        for band, scene in zip(band_names, scenes)
+    ]
+
     # single dataset with every band (future)
-    return client.submit(
-        xr.merge,
-        band_ds_futures,
+    return xr.merge(
+        dask.compute(*band_datasets),
         combine_attrs='override',  # first band's attributes will be used
-        priority=-4,
-        retries=1
     )
 
 
@@ -134,7 +134,7 @@ def save_to_zarr(ds, write_store, mode, success_value):
     return success_value
 
 
-def calculate_job_median(job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, client):
+def calculate_job_median(job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store):
     """A job compatible with `process_catalog` which computes per-band median reflectance for the input job_df.
     
     Args:
@@ -146,54 +146,43 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, band_names, qa_band
         qa_band_name (str): Name of the QA band to use for masking
         chunks (Dict[str, int]): How to chunk HLS input data
         write_store (fsspec.FSMap): The location to write any results
-        client (dask.distributed.Client): Dask cluster client to submit tasks to
         
     Returns:
-        dask.distributed.Future: Future for the computation that is being done, can be waited on.
+        Any: Result of the computation to be passed back to process_catalog
         
     """
     
-    scene_ds_futures = []
+    scene_datasets = []
     for _, row in job_df.iterrows():
-        # single dataset with every band (future)
-        scene_ds_futures.append(
+        # single dataset with every band
+        scene_datasets.append(
             get_scene_dataset(
                 scene=row['scene'],
                 sensor=row['sensor'],
                 bands=bands,
                 band_names=band_names,
-                chunks=chunks,
-                client=client
+                chunks=chunks
             )
         )
-        
+
     # dataset of a single index/tile with a data var for every band and dimensions: x, y, time
-    job_ds_future = client.submit(
-        xr.concat,
-        scene_ds_futures,
+    job_ds_future = xr.concat(
+        dask.compute(*scene_datasets),
         dim=pd.DatetimeIndex(job_df['dt'].tolist(), name='time'),
-        combine_attrs='override',  # use first dataset's attributes
-        priority=-3,
-        retries=1
+        combine_attrs='override',
     )
     # compute masked, monthly, median per band per pixel
-    median = client.submit(
-        compute_tile_median,
+    median = compute_tile_median(
         job_ds_future,
         job_groupby,
         qa_band_name,
-        priority=-2,
-        retries=1
     )
     # save to zarr
-    return client.submit(
-        save_to_zarr,
+    return save_to_zarr(
         median,
         write_store,
         'w',
         job_id,
-        priority=-1,
-        retries=1,
     )
 
 
@@ -219,91 +208,115 @@ def process_catalog(
     account_name,
     storage_container,
     account_key,
-    client,
     concurrency,
     checkpoint_path,
     logger,
+    cluster_args,
+    code_path=None,
+    cluster_restart_freq=-1,
 ):
-    """Process a catalog.
+    """Process a catalog. This function handles job submission, checkpointing successful jobs, managing job concurrency, and cluster management.
     
     Args:
         catalog (xarray.Dataset): catalog to process
         catalog_groupby (str): column to group the catalog in to jobs by (e.g. 'INDEX', 'tile')
         job_fn: a function to apply to each job from the grouped catalog (e.g. `calculate_job_median`)
         job_groupby (str): how to group data built within each job (e.g. 'time.month', 'time.year')
-         chunks (Dict[str, int]): How to chunk HLS input data
+        chunks (Dict[str, int]): How to chunk HLS input data
         account_name (str): Azure storage account to write results to
         storage_container (str): Azure storage container within the `account_name` to write results to
         account_key (str): Azure account key for the `account_name` which results are written to
-        client (dask.distributed.Client): Dask cluster client to submit tasks to
         concurrency (int): Number of jobs to have running on the Dask cluster at once, must be >0
         checkpoint_path (str): Path to a local file for reading and updating checkpoints
         logger (logging.Logger): Logger to log info to.
+        cluster_args (Dict[str, int]): Dict with kwargs (workers, worker_threads, worker_memory, scheduler_threads, scheduler_memory) for the create_cluster command in utils/dask.py
+        code_path: Path to code to upload to cluster
+        cluster_restart_freq (dask_gateway.GatewayCluster): How often to restart the cluster, <= -1 means never, must be greater than `concurrency` or -1
         
     """
-    bands = catalog.attrs['bands']
-    band_names = [band.name for band in bands]
-    qa_band_name = HLSBand.QA.name
-
-    df = catalog.to_dataframe()
-    first_futures = []
-    start_time = time.perf_counter()
-    jobs = list(df.groupby(catalog_groupby))
-    checkpoints = _read_checkpoints(checkpoint_path, logger)
-    
-    metrics = dict(
-        job_errors=0,
-        job_skips=0,
-        job_completes=0
-    )
-
-    # submit first set of jobs
-    while len(first_futures) < concurrency and len(jobs) > 0:
-        job_id, job_df = jobs.pop(0)
-        if str(job_id) in checkpoints:
-            logger.info(f"Skipping checkpointed job {job_id}")
-            metrics['job_skips'] += 1
-            continue
-        logger.info(f"Submitting job {job_id}")
-        write_store = fsspec.get_mapper(
-            f"az://{storage_container}/{job_id}.zarr",
-            account_name=account_name,
-            account_key=account_key
-        )
-        first_futures.append(
-            job_fn(job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, client)
-        )
-    
-    # wait on completed jobs
-    ac = as_completed(first_futures)
-    for future in ac:
-        try:
-            result = future.result()
-            logger.info(f"Completed job {result}")
-            metrics['job_completes'] += 1
-            with open(checkpoint_path, 'a') as checkpoint_file:
-                checkpoint_file.write(str(result) + '\n')
-        except Exception as e:
-            logger.exception("Exception from dask cluster")
-            metrics['job_errors'] += 1
-        # Find a job that hasn't been completed and start it
-        already_done = True
-        while already_done and len(jobs) > 0:
-            job_id, job_df = jobs.pop(0)
-            if str(job_id) in checkpoints:
-                logger.info(f"Skipping checkpointed job {job_id}")
-                metrics['job_skips'] += 1
-                continue
-            already_done = False
-            # submit job
+    def run_job_subset(job_subset, client):
+        first_futures = []
+        
+        # submit first set of jobs
+        while len(first_futures) < concurrency and len(job_subset) > 0:
+            job_id, job_df = job_subset.pop(0)
             logger.info(f"Submitting job {job_id}")
             write_store = fsspec.get_mapper(
                 f"az://{storage_container}/{job_id}.zarr",
                 account_name=account_name,
                 account_key=account_key
             )
-            ac.add(
-                job_fn(job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, client)
+            first_futures.append(
+                client.submit(job_fn, job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, retries=1)
             )
+
+        # wait on completed jobs
+        ac = as_completed(first_futures)
+        for future in ac:
+            try:
+                result = future.result()
+                logger.info(f"Completed job {result}")
+                metrics['job_completes'] += 1
+                with open(checkpoint_path, 'a') as checkpoint_file:
+                    checkpoint_file.write(str(result) + '\n')
+            except Exception as e:
+                logger.exception("Exception from dask cluster")
+                metrics['job_errors'] += 1
+            # submit another job
+            if len(job_subset) > 0:
+                job_id, job_df = job_subset.pop(0)
+                logger.info(f"Submitting job {job_id}")
+                write_store = fsspec.get_mapper(
+                    f"az://{storage_container}/{job_id}.zarr",
+                    account_name=account_name,
+                    account_key=account_key
+                )
+                ac.add(
+                    client.submit(job_fn, job_id, job_df, job_groupby, bands, band_names, qa_band_name, chunks, write_store, retries=1)
+                )
+
+    assert cluster_restart_freq > concurrency or cluster_restart_freq == -1, "cluster_restart_freq must be greater than concurrency or -1"
+    
+    # zip code if provided
+    zipped_path = zip_code(code_path) if code_path else None
+    
+    # set up band information from catalog
+    bands = catalog.attrs['bands']
+    band_names = [band.name for band in bands]
+    qa_band_name = HLSBand.QA.name
+
+    # start metrics
+    metrics = dict(
+        job_errors=0,
+        job_skips=0,
+        job_completes=0
+    )
+    start_time = time.perf_counter()
+    
+    # set up catalog, jobs, and checkpoints
+    df = catalog.to_dataframe()
+    checkpoints = _read_checkpoints(checkpoint_path, logger)
+    jobs = []
+    for job_id, job in df.groupby(catalog_groupby):
+        if job_id in checkpoints:
+            logger.info(f"Skipping checkpointed job {job_id}")
+            metrics['job_skips'] += 1
+        else:
+            jobs.append((job_id, job))
+
+    if cluster_restart_freq == -1:
+        cluster_restart_freq = len(jobs)
+    
+    for start_idx in range(0, len(jobs), cluster_restart_freq):
+        subset = jobs[start_idx:start_idx+cluster_restart_freq]
+        logger.info("Starting cluster")
+        with create_cluster(**cluster_args) as cluster:
+            logger.info("Cluster dashboard visible at %s", cluster.dashboard_link)
+            cluster_client = cluster.get_client()
+            if zipped_path:
+                logger.info("Uploading code to cluster")
+                cluster_client.upload_file(zipped_path)
+            run_job_subset(subset, cluster_client)
+    
     metrics['time'] = time.perf_counter()-start_time
     logger.info(f"Metrics: {json.dumps(metrics)}")

@@ -27,19 +27,14 @@ def create_cluster(workers, worker_threads=1, worker_memory=2, scheduler_threads
     cluster.scale(workers)
     return cluster
 
-def upload_source(path, client):
-    """Upload the data in the given path directory to the client's workers as a zip file
-    
-    Args:
-        path (str): Path to directory to zip + upload
-        client (dask.distributed.Client): client to submit upload to
-        
-    """
+
+def zip_code(path):
     tmp_dir = tempfile.mkdtemp()
     zip_path = os.path.join(tmp_dir, 'source.zip')
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
         _zipdir(path, zipf)
-    client.upload_file(zip_path)
+    return zip_path
+
 
 def _zipdir(path, zipf):
     # ziph is zipfile handle
