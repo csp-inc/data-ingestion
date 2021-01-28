@@ -219,6 +219,8 @@ def process_jobs(
 ):
     """Process a list of jobs. This function handles cluster management, job submission, checkpointing successful jobs, and job concurrency.
     
+    To log within your job_fn use dask.distributed.get_worker().log_event("message", <Anything>)
+    
     Args:
         jobs (Iterable[Tuple[Any, Any]]): Iterable of jobs to process. Each job is a pair of (job_id, job_data). Job data is any data necessary to compute the job, often a dataframe. 
         job_fn: a function to apply to each job (e.g. `calculate_job_median`)
@@ -278,7 +280,7 @@ def process_jobs(
     checkpoints = _read_checkpoints(checkpoint_path, logger)
     incomplete_jobs = []
     for job_id, job in jobs:
-        if job_id in checkpoints:
+        if str(job_id) in checkpoints:
             logger.info(f"Skipping checkpointed job {job_id}")
             metrics['job_skips'] += 1
         else:
@@ -291,12 +293,15 @@ def process_jobs(
         subset = incomplete_jobs[start_idx:start_idx+cluster_restart_freq]
         logger.info("Starting cluster")
         with create_cluster(**cluster_args) as cluster:
-            logger.info("Cluster dashboard visible at %s", cluster.dashboard_link)
-            cluster_client = cluster.get_client()
-            if zipped_path:
-                logger.info("Uploading code to cluster")
-                cluster_client.upload_file(zipped_path)
-            run_job_subset(subset, cluster_client)
+            try:
+                logger.info("Cluster dashboard visible at %s", cluster.dashboard_link)
+                cluster_client = cluster.get_client()
+                if zipped_path:
+                    logger.info("Uploading code to cluster")
+                    cluster_client.upload_file(zipped_path)
+                run_job_subset(subset, cluster_client)
+            finally:
+                logger.info(cluster_client.get_events("message"))
     
     metrics['time'] = time.perf_counter()-start_time
     logger.info(f"Metrics: {json.dumps(metrics)}")
