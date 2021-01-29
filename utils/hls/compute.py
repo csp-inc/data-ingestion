@@ -117,6 +117,9 @@ def compute_tile_median(ds, groupby, qa_name):
         .chunk({'month': 1, 'y': 3660, 'x': 3660})  # groupby + median changes chunk size...lets change it back
     )
 
+def save_to_cog(ds, write_store, success_value):
+    ds.isel(year=0).to_raster(write_store)
+    return success_value
 
 def save_to_zarr(ds, write_store, mode, success_value):
     """Save given dataset to zarr.
@@ -185,11 +188,16 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_nam
         qa_band_name,
     )
     # save to zarr
-    return save_to_zarr(
+#    return save_to_zarr(
+#        median,
+#        write_store,
+#        'w',
+#        job_id,
+#    )
+    return save_to_cog(
         median,
         write_store,
-        'w',
-        job_id,
+        job_id
     )
 
 
