@@ -281,7 +281,7 @@ def process_jobs(
     incomplete_jobs = []
     for job_id, job in jobs:
         if str(job_id) in checkpoints:
-            logger.info(f"Skipping checkpointed job {job_id}")
+            logger.debug(f"Skipping checkpointed job {job_id}")
             metrics['job_skips'] += 1
         else:
             incomplete_jobs.append((job_id, job))

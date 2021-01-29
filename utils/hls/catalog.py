@@ -15,11 +15,13 @@ import io
 from datetime import datetime
 from functools import lru_cache
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rtree
 import xarray as xr
 from azure.storage.blob import ContainerClient
+from shapely.geometry import box
 
 from enum import Enum
 
@@ -73,27 +75,38 @@ class HLSBand(Enum):
         else:
             return BAND_TO_S30[self.value]
 
-
 class HLSTileLookup:
     """Wrapper around an rtree for finding HLS tile ids."""
 
     def __init__(self):
-        hls_tile_extents = self._get_extents()
+        self.tile_extents = self._get_extents()
+        self.tile_gpd = self._get_boxes()
         self.tree_idx = rtree.index.Index()
         self.idx_to_id = {}
-        for i_row,row in hls_tile_extents.iterrows():
+        self.idx_to_all = {}
+        for i_row, row in self.tile_extents.iterrows():
             self.tree_idx.insert(i_row, (row.MinLon, row.MinLat, row.MaxLon, row.MaxLat))
             self.idx_to_id[i_row] = row.TilID
 
     def _get_extents(self):
         hls_tile_extents_url = 'https://ai4edatasetspublicassets.blob.core.windows.net/assets/S2_TilingSystem2-1.txt?st=2019-08-23T03%3A25%3A57Z&se=2028-08-24T03%3A25%3A00Z&sp=rl&sv=2018-03-28&sr=b&sig=KHNZHIJuVG2KqwpnlsJ8truIT5saih8KrVj3f45ABKY%3D'
         # Load this file into a table, where each row is:
-        # Tile ID, Xstart, Ystart, UZ, EPSG, MinLon, MaxLon, MinLon, MaxLon
+        # Tile ID, Xstart, Ystart, UZ, EPSG, MinLon, MaxLon, MinLat, MaxLat
         print('Reading tile extents...')
         s = requests.get(hls_tile_extents_url).content
         hls_tile_extents = pd.read_csv(io.StringIO(s.decode('utf-8')),delimiter=r'\s+')
         print('Read tile extents for {} tiles'.format(len(hls_tile_extents)))
         return hls_tile_extents
+
+    def _get_boxes(self):
+        return gpd.GeoDataFrame(
+            self.tile_extents,
+            crs="EPSG:4326",
+            geometry=[
+                box(r['MinLon'], r['MinLat'], r['MaxLon'], r['MaxLat'])
+                for _, r in self.tile_extents.iterrows()
+            ]
+        )
 
     def get_point_hls_tile_ids(self, lat, lon):
         results = list(self.tree_idx.intersection((lon, lat, lon, lat)))
@@ -104,6 +117,25 @@ class HLSTileLookup:
             self.idx_to_id[i]
             for i in self.tree_idx.intersection((left, bottom, right, top))
         )
+
+    def get_geometry_hls_tile_ids(self, geometry):
+        tiles_in_aoi = gpd.overlay(geometry, self.tile_gpd, how='intersection')
+        return set(tiles_in_aoi['TilID'])
+
+    def get_hls_tile_info(self, tile_ids):
+        return self.tile_extents[self.tile_extents['TilID'].isin(tile_ids)]
+
+    def get_point_hls_tile_info(self, lat, lon):
+        tile_ids = self.get_point_hls_tile_ids(lat, lon)
+        return self.get_hls_tile_info(tile_ids)
+
+    def get_bbox_hls_tile_info(self, left, bottom, right, top):
+        tile_ids = self.get_bbox_hls_tile_ids(left, bottom, right, top)
+        return self.get_hls_tile_info(tile_ids)
+
+    def get_geometry_hls_tile_info(self, geometry):
+        tile_ids = self.get_geometry_hls_tile_ids(geometry)
+        return self.get_hls_tile_info(tile_ids)
 
 
 class HLSCatalog:
@@ -151,20 +183,8 @@ class HLSCatalog:
         df = df
         df['tile'] = df.apply(lambda row: lookup.get_point_hls_tile_ids(row.lat, row.lon), axis=1)
         df = df.explode('tile')
-
         if include_scenes:
-            # join landsat and sentinel scenes
-            landsat = df.apply(lambda row: _list_scenes('L30', 'L30', row.tile, int(row.year)), axis=1)
-            sentinel = df.apply(lambda row: _list_scenes('S30', 'S30', row.tile, int(row.year)), axis=1)
-            df['scenes'] = landsat + sentinel
-            # filter out rows w/ empty scenes
-            df = df[df.scenes.astype(bool)]
-            # explode list of scenes into one row per scene
-            df = df.explode('scenes').rename({'scenes': 'scene'}, axis=1)
-            df['sensor'] = df.apply(lambda row: 'L' if 'L30' in row.scene else 'S', axis=1)
-            # get datetime for scene
-            df['dt'] = df.apply(lambda row: _scene_to_datetime(row.scene), axis=1)
-
+            df = _tiles_to_scenes(df)
         # create xr_dataset
         xr_ds = xr.Dataset.from_dataframe(df)
         xr_ds.attrs['bands'] = bands
@@ -178,23 +198,27 @@ class HLSCatalog:
         df['years'] = [years] * len(tiles)
         df = df.explode('years').rename({'years': 'year'}, axis=1)
         if include_scenes:
-            # join landsat and sentinel scenes
-            landsat = df.apply(lambda row: _list_scenes('L30', 'L30', row.tile, int(row.year)), axis=1)
-            sentinel = df.apply(lambda row: _list_scenes('S30', 'S30', row.tile, int(row.year)), axis=1)
-            df['scenes'] = landsat + sentinel
-            # filter out rows w/ empty scenes
-            df = df[df.scenes.astype(bool)]
-            # explode list of scenes into one row per scene
-            df = df.explode('scenes').rename({'scenes': 'scene'}, axis=1)
-            df['sensor'] = df.apply(lambda row: 'L' if 'L30' in row.scene else 'S', axis=1)
-            # get datetime for scene
-            df['dt'] = df.apply(lambda row: _scene_to_datetime(row.scene), axis=1)
+            df = _tiles_to_scenes(df)
         # create xr_dataset
         xr_ds = xr.Dataset.from_dataframe(df)
         xr_ds.attrs['bands'] = bands
         return cls(xr_ds)
 
+    @classmethod
+    def from_geom(cls, geom, years, bands=[], tile_lookup=None, include_scenes=True):
+        lookup = tile_lookup if tile_lookup else HLSTileLookup()
+        tiles = list(lookup.get_geometry_hls_tile_ids(geom))
+        df = pd.DataFrame(tiles).rename({0: 'tile'}, axis=1)
+        df['years'] = [years] * len(tiles)
+        df = df.explode('years').rename({'years': 'year'}, axis=1)
+        if include_scenes:
+            df = _tiles_to_scenes(df)
+        # create xr_dataset
+        xr_ds = xr.Dataset.from_dataframe(df)
+        xr_ds.attrs['bands'] = bands
+        return cls(xr_ds)
 
+    
 def fia_csv_to_data_catalog_input(path):
     df = pd.read_csv(path)
     df.rename({"LAT": "lat", "LON": "lon"}, inplace=True, axis=1)
@@ -230,6 +254,20 @@ def _list_scenes(folder, product, tile, year):
         data.append(url.split('_')[0])
     return data
 
+
+def _tiles_to_scenes(df):
+    # join landsat and sentinel scenes
+    landsat = df.apply(lambda row: _list_scenes('L30', 'L30', row.tile, int(row.year)), axis=1)
+    sentinel = df.apply(lambda row: _list_scenes('S30', 'S30', row.tile, int(row.year)), axis=1)
+    df['scenes'] = landsat + sentinel
+    # filter out rows w/ empty scenes
+    df = df[df.scenes.astype(bool)]
+    # explode list of scenes into one row per scene
+    df = df.explode('scenes').rename({'scenes': 'scene'}, axis=1)
+    df['sensor'] = df.apply(lambda row: 'L' if 'L30' in row.scene else 'S', axis=1)
+    # get datetime for scene
+    df['dt'] = df.apply(lambda row: _scene_to_datetime(row.scene), axis=1)
+    return df
 
 def scene_to_urls(scene, sensor, bands):
     """Take a scene id and a list of HLSBand enums and constructs an Azure blob url for each band.
