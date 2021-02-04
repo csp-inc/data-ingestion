@@ -2,9 +2,11 @@ import json
 import time
 from functools import partial
 
-import  dask
+import dask
 import fsspec
+import os
 import pandas as pd
+import rioxarray
 import xarray as xr
 from dask.distributed import as_completed
 
@@ -114,11 +116,11 @@ def compute_tile_median(ds, groupby, qa_name):
         .where(ds >= 0)
         .groupby(groupby)
         .median(keep_attrs=True)
-        .chunk({'month': 1, 'y': 3660, 'x': 3660})  # groupby + median changes chunk size...lets change it back
+        .chunk({'year': 1, 'y': 3660, 'x': 3660})  # groupby + median changes chunk size...lets change it back
     )
 
 def save_to_cog(ds, write_store, success_value):
-    ds.isel(year=0).to_raster(write_store)
+    ds.isel(year=0).rio.to_raster(write_store)
     return success_value
 
 def save_to_zarr(ds, write_store, mode, success_value):
@@ -155,7 +157,7 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_nam
         
     """
     write_store = fsspec.get_mapper(
-        f"az://{storage_container}/{job_id}.zarr",
+        f"az://{storage_container}/{job_id}.tif",
         account_name=account_name,
         account_key=account_key
     )
@@ -187,18 +189,21 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_nam
         job_groupby,
         qa_band_name,
     )
+
+    os.environ['AZURE_STORAGE_ACCOUNT'] = 'lumonitoreastus2'
+    os.environ['AZURE_STORAGE_ACCESS_KEY'] = ']=9Pi0A+Cpea9GOhfpB/OSahr6mlygq/LgUS0yqQPBTPv8Dcooi0HDsUkHruH2c7N/vZumWceK+0hWVpkq+7MhYg=='
     # save to zarr
-#    return save_to_zarr(
-#        median,
-#        write_store,
-#        'w',
-#        job_id,
-#    )
-    return save_to_cog(
+    return save_to_zarr(
         median,
         write_store,
-        job_id
+        'w',
+        job_id,
     )
+    #return save_to_cog(
+    #    median,
+    #    write_store,
+    #    job_id
+    #)
 
 
 def _read_checkpoints(path, logger):
