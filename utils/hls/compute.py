@@ -120,7 +120,7 @@ def compute_tile_median(ds, groupby, qa_name):
     )
 
 def save_to_cog(ds, write_store, success_value):
-    ds.isel(year=0).rio.to_raster(write_store)
+    ds.isel(year=0).rio.to_raster('utils/test.tif')
     return success_value
 
 def save_to_zarr(ds, write_store, mode, success_value):
@@ -190,8 +190,6 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_nam
         qa_band_name,
     )
 
-    os.environ['AZURE_STORAGE_ACCOUNT'] = 'lumonitoreastus2'
-    os.environ['AZURE_STORAGE_ACCESS_KEY'] = ']=9Pi0A+Cpea9GOhfpB/OSahr6mlygq/LgUS0yqQPBTPv8Dcooi0HDsUkHruH2c7N/vZumWceK+0hWVpkq+7MhYg=='
     # save to zarr
     return save_to_zarr(
         median,
