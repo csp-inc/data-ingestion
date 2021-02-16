@@ -139,7 +139,7 @@ def save_to_zarr(ds, write_store, mode, success_value):
     return success_value
 
 
-def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_name, storage_container, account_key):
+def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_name, storage_container, subfolder, account_key):
     """A job compatible with `process_catalog` which computes per-band median reflectance for the input job_df.
     
     Args:
@@ -157,7 +157,7 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_nam
         
     """
     write_store = fsspec.get_mapper(
-        f"az://{storage_container}/{job_id}.tif",
+        f"az://{storage_container}/{subfolder}/{job_id}.zarr",
         account_name=account_name,
         account_key=account_key
     )
