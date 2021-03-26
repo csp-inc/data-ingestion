@@ -2,9 +2,9 @@ import os
 import tempfile
 import zipfile
 
-from dask_gateway import GatewayCluster
+from dask_gateway import Gateway, GatewayCluster
 
-def create_cluster(workers, worker_threads=1, worker_memory=2, scheduler_threads=1, scheduler_memory=2):
+def create_cluster(workers, worker_threads=1, worker_memory=2, scheduler_threads=1, scheduler_memory=2, environment_options={}):
     """Create and return a cluster with a given number of workers each with `cores` and `memory`
     
     Args:
@@ -18,11 +18,17 @@ def create_cluster(workers, worker_threads=1, worker_memory=2, scheduler_threads
         dask_gateway.GatewayCluster: started cluster
         
     """
+    # You got another way???
+    g = Gateway()
+    options = g.cluster_options()
+    options.environment = environment_options
+    
     cluster = GatewayCluster(
         worker_cores=worker_threads,
         worker_memory=worker_memory,
         scheduler_cores=scheduler_threads,
-        scheduler_memory=scheduler_memory
+        scheduler_memory=scheduler_memory,
+        cluster_options=options
     )
     cluster.scale(workers)
     return cluster

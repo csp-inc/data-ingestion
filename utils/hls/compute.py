@@ -119,8 +119,14 @@ def compute_tile_median(ds, groupby, qa_name):
         .chunk({'year': 1, 'y': 3660, 'x': 3660})  # groupby + median changes chunk size...lets change it back
     )
 
-def save_to_cog(ds, write_store, success_value):
-    ds.isel(year=0).rio.to_raster('utils/test.tif')
+def save_to_cog(ds, path, success_value):
+    ds.isel(year=0).rio.to_raster(
+        '/vsiaz/lumonitor/test3.tif',
+        dtype='float32',
+        compress='LZW',
+        predictor=3,
+        tiled=True
+    )
     return success_value
 
 def save_to_zarr(ds, write_store, mode, success_value):
@@ -139,7 +145,7 @@ def save_to_zarr(ds, write_store, mode, success_value):
     return success_value
 
 
-def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_name, storage_container, subfolder, account_key):
+def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_name, storage_container, account_key, subfolder):
     """A job compatible with `process_catalog` which computes per-band median reflectance for the input job_df.
     
     Args:
@@ -156,11 +162,7 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_nam
         Any: Result of the computation to be passed back to process_catalog
         
     """
-    write_store = fsspec.get_mapper(
-        f"az://{storage_container}/{subfolder}/{job_id}.zarr",
-        account_name=account_name,
-        account_key=account_key
-    )
+
     band_names = [band.name for band in bands]
     qa_band_name = HLSBand.QA.name
     
@@ -191,6 +193,12 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_nam
     )
 
     # save to zarr
+        
+    write_store = fsspec.get_mapper(
+        f"az://{storage_container}/{subfolder}/{job_id}.zarr",
+        account_name=account_name,
+        account_key=account_key
+    )
     return save_to_zarr(
         median,
         write_store,
@@ -199,7 +207,7 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_nam
     )
     #return save_to_cog(
     #    median,
-    #    write_store,
+    #    f'{job_id}_{subfolder}.tif',
     #    job_id
     #)
 
