@@ -21,8 +21,8 @@ def create_cluster(workers, worker_threads=1, worker_memory=2, scheduler_threads
     cluster = GatewayCluster(
         worker_cores=worker_threads,
         worker_memory=worker_memory,
-        scheduler_cores=scheduler_threads,
-        scheduler_memory=scheduler_memory
+        #scheduler_cores=scheduler_threads,
+        #scheduler_memory=scheduler_memory
     )
     cluster.scale(workers)
     return cluster
