@@ -121,10 +121,10 @@ def compute_tile_median(ds, groupby, qa_name):
 
 def save_to_cog(ds, path, success_value):
     ds.isel(year=0).rio.to_raster(
-        '/vsiaz/lumonitor/test3.tif',
-        dtype='float32',
+        path,
+        dtype='int16',
         compress='LZW',
-        predictor=3,
+        predictor=2,
         tiled=True
     )
     return success_value
@@ -141,7 +141,7 @@ def save_to_zarr(ds, write_store, mode, success_value):
     Returns:
         Any: the provided success_value
     """
-    ds.to_zarr(write_store, mode=mode)
+    ds.astype('int16').to_zarr(write_store, mode=mode)
     return success_value
 
 
@@ -192,24 +192,19 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_nam
         qa_band_name,
     )
 
-    # save to zarr
         
     write_store = fsspec.get_mapper(
         f"az://{storage_container}/{subfolder}/{job_id}.zarr",
         account_name=account_name,
         account_key=account_key
     )
+    
     return save_to_zarr(
         median,
         write_store,
         'w',
         job_id,
     )
-    #return save_to_cog(
-    #    median,
-    #    f'{job_id}_{subfolder}.tif',
-    #    job_id
-    #)
 
 
 def _read_checkpoints(path, logger):
