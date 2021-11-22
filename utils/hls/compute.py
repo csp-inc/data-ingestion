@@ -6,7 +6,11 @@ import  dask
 import fsspec
 import pandas as pd
 import xarray as xr
+import numpy as np
+import rasterio
 from dask.distributed import as_completed
+from dask.distributed import Client
+from rasterio.errors import RasterioIOError
 
 from utils.dask import create_cluster
 from utils.dask import zip_code
@@ -49,7 +53,10 @@ def fetch_band_url(band, url, chunks):
         xarray.Dataset: Dataset for the given HLS scene url with the data variable being named the given band
         
     """
-    da = xr.open_rasterio(url, chunks=chunks)
+    try:
+        da = xr.open_rasterio(url, chunks=chunks)
+    except RasterioIOError:
+        return None
     da = da.squeeze().drop_vars('band')
     # There is a bug in open_rasterio as it doesn't coerce scale_factor/add_offset to a float, but leaves it as a string.
     # If you then save this file as a zarr it will save scale_factor/add_offset as a string
@@ -80,12 +87,16 @@ def get_scene_dataset(scene, sensor, bands, band_names, chunks):
         fetch_band_url(band, scene, chunks=chunks)
         for band, scene in zip(band_names, scenes)
     ]
-
     # single dataset with every band (future)
-    return xr.merge(
-        dask.compute(*band_datasets),
-        combine_attrs='override',  # first band's attributes will be used
-    )
+    dslist = dask.compute(*band_datasets)
+    dslist = [x for x in dslist if x is not None]
+    if len(dslist) != len(bands):
+        return None
+    else:
+        return xr.merge(
+            dslist,
+            combine_attrs='override',  # first band's attributes will be used
+        )
 
 
 def compute_tile_median(ds, groupby, qa_name):
@@ -102,14 +113,21 @@ def compute_tile_median(ds, groupby, qa_name):
         
     """
     # apply QA mask
-    if qa_name in ds.data_vars:
-        qa_mask = get_mask(ds[qa_name])
-        ds = (ds
-            .drop_vars(qa_name)  # drop QA band
-            .where(qa_mask)  # Apply mask
-        )
+    for rt in range(2):
+        try:
+            if qa_name in ds.data_vars:
+                qa_mask = get_mask(ds[qa_name])
+                ds = (ds
+                    .drop_vars(qa_name)  # drop QA band
+                    .where(qa_mask)  # Apply mask
+                )
+        except TypeError as e:
+            #Handle non georeferenced data. Pixel indices become X and Y
+            x = ds['x'].to_numpy()
+            goodinds = np.where(x > 3700)[0]
+            ds = ds.isel({'x':goodinds})
+# valid range is 0-10000 per LaSRC v3 guide: https://prd-wret.s3.us-west-2.amazonaws.com/assets/palladium/production/atoms/files/LSDS-1368_L8_C1-LandSurfaceReflectanceCode-LASRC_ProductGuide-v3.pdf
     return (ds
-        # valid range is 0-10000 per LaSRC v3 guide: https://prd-wret.s3.us-west-2.amazonaws.com/assets/palladium/production/atoms/files/LSDS-1368_L8_C1-LandSurfaceReflectanceCode-LASRC_ProductGuide-v3.pdf
         .where(ds <= 10000)
         .where(ds >= 0)
         .groupby(groupby)
@@ -162,20 +180,19 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_nam
     scene_datasets = []
     for _, row in job_df.iterrows():
         # single dataset with every band
-        scene_datasets.append(
-            get_scene_dataset(
-                scene=row['scene'],
-                sensor=row['sensor'],
-                bands=bands,
-                band_names=band_names,
-                chunks=chunks
-            )
-        )
-
+        scene_datasets.append(get_scene_dataset(
+            scene=row['scene'],
+            sensor=row['sensor'],
+            bands=bands,
+            band_names=band_names,
+            chunks=chunks
+        ))
+    comp_sds = list(dask.compute(*scene_datasets))
+    goodinds = np.where(comp_sds is not None)[0]
     # dataset of a single index/tile with a data var for every band and dimensions: x, y, time
     job_ds_future = xr.concat(
-        dask.compute(*scene_datasets),
-        dim=pd.DatetimeIndex(job_df['dt'].tolist(), name='time'),
+        list(map(comp_sds.__getitem__,goodinds)),
+        dim=pd.DatetimeIndex(job_df['dt'].values[goodinds], name='time'),
         combine_attrs='override',
     )
     # compute masked, monthly, median per band per pixel
@@ -185,13 +202,35 @@ def calculate_job_median(job_id, job_df, job_groupby, bands, chunks, account_nam
         qa_band_name,
     )
     # save to zarr
-    return save_to_zarr(
-        median,
-        write_store,
-        'w',
-        job_id,
-    )
-
+    for it in range(2):
+        try:
+            return save_to_zarr(
+                median,
+                write_store,
+                'w',
+                job_id,
+            )
+        except rasterio.errors.RasterioIOError:
+            y = median['y'].to_numpy()
+            goodinds = np.where(y > 3700)[0]
+            median = median.isel({'y':goodinds})
+                
+            
+def check_band_validity(median):
+            sens = 'L' if 'L30' in sc else 'S'
+            badurls=[]
+            for url in scene_to_urls(sc, sens, self.xr_ds.attrs['bands']):
+                try:
+                    with rasterio.open(url) as f:
+                        trans = f.transform.to_gdal()
+                        if np.sum(trans) == 2:
+                            raise rasterio.errors.RasterioIOError('Band is not georeferenced.')
+                        topcheck = f.read(1, window=Window(0, 0, f.width, 10))
+                        botcheck = f.read(1, window=Window(0, f.height-10, f.width, 10))
+                except rasterio.errors.RasterioIOError as e:
+                    badurls.append(url)
+                    continue
+            return badurls
 
 def _read_checkpoints(path, logger):
     """
@@ -295,10 +334,14 @@ def process_jobs(
         with create_cluster(**cluster_args) as cluster:
             try:
                 logger.info("Cluster dashboard visible at %s", cluster.dashboard_link)
-                cluster_client = cluster.get_client()
+                try:
+                    cluster_client = cluster.get_client()
+                except AttributeError:
+                    cluster_client = Client(cluster)
                 if zipped_path:
                     logger.info("Uploading code to cluster")
                     cluster_client.upload_file(zipped_path)
+                logger.info(type(subset[0][1]))
                 run_job_subset(subset, cluster_client)
             finally:
                 logger.info(cluster_client.get_events("message"))

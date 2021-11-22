@@ -14,6 +14,7 @@ import re
 import io
 from datetime import datetime
 from functools import lru_cache
+import concurrent.futures
 
 import geopandas as gpd
 import numpy as np
@@ -22,6 +23,9 @@ import rtree
 import xarray as xr
 from azure.storage.blob import ContainerClient
 from shapely.geometry import box
+from tqdm import tqdm
+import rasterio
+from rasterio.windows import Window
 
 from enum import Enum
 
@@ -149,9 +153,10 @@ class HLSCatalog:
     Includes utility functions for reading/writing to zarr to persist catalog once its created.
     """
 
-    def __init__(self, xr_ds):
+    def __init__(self, xr_ds, validate=False):
         self.xr_ds = xr_ds
-
+        if validate:
+            self._validate_catalog()
     def to_zarr(self, path):
         self.xr_ds.attrs['bands'] = [
             band.value
@@ -162,7 +167,23 @@ class HLSCatalog:
             HLSBand(value)
             for value in self.xr_ds.attrs['bands']
         ]
+    def drop_scenes(self,bad_urls):
+        badtiles=np.unique([x.split('.')[-5] for x in bad_urls])
+        badscenes=['/'.join(x.split('/')[-2:])[:-7] for x in bad_urls]
+        indcopy=self.xr_ds.index.copy()
+        
 
+        self.xr_ds['index'] = np.arange(0,len(indcopy))
+        badinds = np.where(self.xr_ds.data_vars['scene'].isin(badscenes))[0]
+        if len(badinds) == 0:
+            print('Given urls not found in catalog.')
+        else:
+            updatedinds = np.delete(indcopy,badinds)
+            self.xr_ds=self.xr_ds.drop_sel({'index':badinds})
+            self.xr_ds['index']=updatedinds
+            nsize=len(indcopy)-len(badinds)
+            print(f'Dropped {len(badinds)} scenes from the catalog. The new size is {nsize}.')
+        
     @classmethod
     def from_zarr(cls, path):
         catalog = cls(xr.open_zarr(path)) 
@@ -217,8 +238,39 @@ class HLSCatalog:
         xr_ds = xr.Dataset.from_dataframe(df)
         xr_ds.attrs['bands'] = bands
         return cls(xr_ds)
+    @classmethod
+    def from_tilesdf(cls, tilesdf, bands=[], tile_lookup=None, include_scenes=True):
+        if include_scenes:
+            df = _tiles_to_scenes(tilesdf)
+        # create xr_dataset
+        xr_ds = xr.Dataset.from_dataframe(df)
+        xr_ds.attrs['bands'] = bands
+        return cls(xr_ds)
 
-    
+    def _validate_catalog(self):
+        sclist = list(self.xr_ds.data_vars['scene'].values.astype(str))
+        master_badurls =[]
+        print('Validating scene data. This will take some time...')
+        def check_scene_validity(sc):
+            sens = 'L' if 'L30' in sc else 'S'
+            badurls=[]
+            for url in scene_to_urls(sc, sens, self.xr_ds.attrs['bands']):
+                try:
+                    with rasterio.open(url) as f:
+                        trans = f.transform.to_gdal()
+                        if np.sum(trans) == 2:
+                            raise rasterio.errors.RasterioIOError('Band is not georeferenced.')
+                        topcheck = f.read(1, window=Window(0, 0, f.width, 10))
+                        botcheck = f.read(1, window=Window(0, f.height-10, f.width, 10))
+                except rasterio.errors.RasterioIOError as e:
+                    badurls.append(url)
+                    continue
+            return badurls
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            for broken_subset in tqdm(executor.map(check_scene_validity, sclist), total=len(sclist)):
+                master_badurls.extend(broken_subset)
+        self.drop_scenes(master_badurls)
+        
 def fia_csv_to_data_catalog_input(path):
     df = pd.read_csv(path)
     df.rename({"LAT": "lat", "LON": "lon"}, inplace=True, axis=1)
@@ -245,8 +297,9 @@ def _list_available_tiles(prefix, band="01"):
     return files
 
 
+
 @lru_cache(maxsize=10000)
-def _list_scenes(folder, product, tile, year):
+def _list_scenes(tile, year, folder, product):
     prefix = f'{folder}/HLS.{product}.T{tile}.{year}'
     urls = _list_available_tiles(prefix)
     data = []
@@ -257,9 +310,20 @@ def _list_scenes(folder, product, tile, year):
 
 def _tiles_to_scenes(df):
     # join landsat and sentinel scenes
-    landsat = df.apply(lambda row: _list_scenes('L30', 'L30', row.tile, int(row.year)), axis=1)
-    sentinel = df.apply(lambda row: _list_scenes('S30', 'S30', row.tile, int(row.year)), axis=1)
-    df['scenes'] = landsat + sentinel
+    tiles, years = df['tile'].values, df['year'].values
+    N = len(tiles)
+    landsat, sentinel = [],[]
+    print('Searching for matching Landsat scenes...')
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        for urllist in tqdm(executor.map(lambda tinfo: _list_scenes(*tinfo), zip(tiles, years, np.full(N, 'L30'), np.full(N,'L30'))),total=N):
+            landsat.append(urllist)
+        lseries = pd.Series(landsat)
+    print('Searching for matching Sentinel scenes...')
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        for urllist in tqdm(executor.map(lambda tinfo: _list_scenes(*tinfo),zip(tiles, years, np.full(N, 'S30'), np.full(N,'S30'))),total=N):
+            sentinel.append(urllist)
+        sseries = pd.Series(sentinel)
+    df['scenes'] = lseries + sseries
     # filter out rows w/ empty scenes
     df = df[df.scenes.astype(bool)]
     # explode list of scenes into one row per scene
