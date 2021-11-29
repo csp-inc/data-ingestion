@@ -293,7 +293,7 @@ def _list_available_tiles(prefix, band="01"):
     generator = hls_container_client.list_blobs(name_starts_with=prefix)
     for blob in generator:
         if blob.name.endswith(f'{band}.tif'):
-            files.append(blob.name)
+                        files.append(blob.name)
     return files
 
 
@@ -317,12 +317,12 @@ def _tiles_to_scenes(df):
     with concurrent.futures.ThreadPoolExecutor() as executor:
         for urllist in tqdm(executor.map(lambda tinfo: _list_scenes(*tinfo), zip(tiles, years, np.full(N, 'L30'), np.full(N,'L30'))),total=N):
             landsat.append(urllist)
-        lseries = pd.Series(landsat)
+    lseries = pd.Series(landsat)
     print('Searching for matching Sentinel scenes...')
     with concurrent.futures.ThreadPoolExecutor() as executor:
         for urllist in tqdm(executor.map(lambda tinfo: _list_scenes(*tinfo),zip(tiles, years, np.full(N, 'S30'), np.full(N,'S30'))),total=N):
             sentinel.append(urllist)
-        sseries = pd.Series(sentinel)
+    sseries = pd.Series(sentinel)
     df['scenes'] = lseries + sseries
     # filter out rows w/ empty scenes
     df = df[df.scenes.astype(bool)]
