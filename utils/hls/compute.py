@@ -119,16 +119,6 @@ def compute_tile_median(ds, groupby, qa_name):
         .chunk({'year': 1, 'y': 3660, 'x': 3660})  # groupby + median changes chunk size...lets change it back
     )
 
-def save_to_cog(ds, path, success_value):
-    ds.isel(year=0).rio.to_raster(
-        path,
-        dtype='int16',
-        compress='LZW',
-        predictor=2,
-        tiled=True
-    )
-    return success_value
-
 def save_to_zarr(ds, write_store, mode, success_value):
     """Save given dataset to zarr.
     
